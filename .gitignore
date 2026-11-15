@@ -1,0 +1,57 @@
+# --- Secrets and local config ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
+
+# --- Node / Next.js (dashboard) ---
+node_modules/
+.next/
+out/
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# --- Local databases and caches ---
+*.sqlite
+*.sqlite3
+*.db
+.cache/
+
+# --- Models and large artifacts ---
+models/
+*.onnx
+*.safetensors
+*.bin
+wandb/
+
+# --- Eval run outputs ---
+runs/
+
+# --- Logs and temp files ---
+*.log
+tmp/
+
+# --- Editors and OS ---
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
