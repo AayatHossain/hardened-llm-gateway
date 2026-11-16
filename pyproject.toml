@@ -1,0 +1,35 @@
+[project]
+name = "hardened-llm-gateway"
+version = "0.1.0"
+description = "An LLM gateway that routes, caches, guards and traces model calls, with every part measured against a baseline."
+license = "MIT"
+authors = [{ name = "Md. Aayat Hossain Mridha" }]
+requires-python = ">=3.13"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "mypy>=2.4",
+    "pytest>=9.2",
+    "ruff>=0.17",
+]
+
+[build-system]
+requires = ["uv_build>=0.13.8,<0.14"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+# E/W pycodestyle, F pyflakes, I import order, UP newer syntax, B likely bugs, SIM simplifications
+select = ["E", "W", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+strict = true
+python_version = "3.13"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-markers"]
