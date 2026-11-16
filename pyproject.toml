@@ -5,7 +5,9 @@ description = "An LLM gateway that routes, caches, guards and traces model calls
 license = "MIT"
 authors = [{ name = "Md. Aayat Hossain Mridha" }]
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "pydantic-settings>=2.15",
+]
 
 [dependency-groups]
 dev = [
