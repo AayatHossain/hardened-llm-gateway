@@ -13,6 +13,7 @@ from hardened_llm_gateway.providers import (
     ChatRequest,
     OpenAICompatibleProvider,
     ProviderError,
+    ProviderTimeoutError,
 )
 
 pytestmark = pytest.mark.anyio
@@ -117,7 +118,7 @@ async def test_timeout_is_retryable() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ReadTimeout("too slow", request=request)
 
-    with pytest.raises(ProviderError) as info:
+    with pytest.raises(ProviderTimeoutError) as info:
         await make_provider(handler).chat(make_request())
     assert info.value.retryable is True
     assert info.value.status_code is None

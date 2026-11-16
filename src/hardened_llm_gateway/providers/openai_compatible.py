@@ -14,6 +14,7 @@ from hardened_llm_gateway.providers.types import (
     ChatRequest,
     ChatResponse,
     ProviderError,
+    ProviderTimeoutError,
     Usage,
 )
 
@@ -79,7 +80,7 @@ class OpenAICompatibleProvider:
                 self._url, json=payload, headers=headers, timeout=self._timeout
             )
         except httpx.TimeoutException:
-            raise ProviderError(self._name, "request timed out", retryable=True) from None
+            raise ProviderTimeoutError(self._name) from None
         except httpx.TransportError as exc:
             raise ProviderError(
                 self._name, f"network error: {type(exc).__name__}", retryable=True
