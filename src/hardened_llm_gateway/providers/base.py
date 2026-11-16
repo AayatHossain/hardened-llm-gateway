@@ -1,6 +1,6 @@
 """The interface every model provider implements."""
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from typing import Protocol
 
 from hardened_llm_gateway.providers.types import ChatChunk, ChatRequest, ChatResponse
@@ -18,4 +18,4 @@ class Provider(Protocol):
 
     async def chat(self, request: ChatRequest) -> ChatResponse: ...
 
-    def stream(self, request: ChatRequest) -> AsyncIterator[ChatChunk]: ...
+    def stream(self, request: ChatRequest) -> AsyncGenerator[ChatChunk]: ...

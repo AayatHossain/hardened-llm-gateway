@@ -1,6 +1,7 @@
 """Tests for POST /v1/chat/completions, with a fake provider (no network, no keys)."""
 
-from collections.abc import AsyncIterator
+import json
+from collections.abc import AsyncGenerator
 from typing import Any
 
 import pytest
@@ -30,7 +31,7 @@ class FakeProvider:
         self.fail_after_chunks = fail_after_chunks
         self.requests: list[ChatRequest] = []
 
-    async def stream(self, request: ChatRequest) -> AsyncIterator[ChatChunk]:
+    async def stream(self, request: ChatRequest) -> AsyncGenerator[ChatChunk]:
         self.requests.append(request)
         for index, piece in enumerate(["Hel", "lo!"]):
             if self.error is not None and index == self.fail_after_chunks:
@@ -107,11 +108,61 @@ def test_unknown_provider_lists_enabled_ones() -> None:
     assert "enabled: fake" in response.json()["error"]["message"]
 
 
-def test_streaming_is_rejected_for_now() -> None:
+def stream_events(response: Any) -> list[Any]:
+    """Parse a server-sent-events body: JSON events as dicts, "[DONE]" as a string."""
+    events: list[Any] = []
+    for line in response.text.splitlines():
+        if line.startswith("data: "):
+            data = line[len("data: ") :]
+            events.append(data if data == "[DONE]" else json.loads(data))
+    return events
+
+
+def test_streaming_chat() -> None:
     provider = FakeProvider()
     response = post(provider, {"model": "fake/m1", "messages": MESSAGES, "stream": True})
-    assert response.status_code == 400
-    assert provider.requests == []
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert response.headers["x-gateway-provider"] == "fake"
+    assert "x-gateway-first-chunk-ms" in response.headers
+
+    events = stream_events(response)
+    assert events[-1] == "[DONE]"
+    chunks = events[:-1]
+    assert all(c["object"] == "chat.completion.chunk" for c in chunks)
+    assert all(c["model"] == "fake/m1" for c in chunks)
+    assert len({c["id"] for c in chunks}) == 1
+    assert chunks[0]["choices"][0]["delta"]["role"] == "assistant"
+    assert "".join(c["choices"][0]["delta"]["content"] for c in chunks) == "Hello!"
+    assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+    assert chunks[-1]["usage"]["total_tokens"] == 5
+    assert provider.requests[0].model == "m1"
+
+
+def test_stream_error_before_first_chunk_is_a_normal_http_error() -> None:
+    error = ProviderError(
+        "fake", "HTTP 429", status_code=429, retryable=True, retry_after_seconds=2
+    )
+    response = post(
+        FakeProvider(error, fail_after_chunks=0),
+        {"model": "fake/m1", "messages": MESSAGES, "stream": True},
+    )
+    assert response.status_code == 429
+    assert response.headers["retry-after"] == "2"
+
+
+def test_stream_error_mid_reply_becomes_an_error_event() -> None:
+    error = ProviderError("fake", "network error: ReadError", retryable=True)
+    response = post(
+        FakeProvider(error, fail_after_chunks=1),
+        {"model": "fake/m1", "messages": MESSAGES, "stream": True},
+    )
+    assert response.status_code == 200  # headers were already sent
+    events = stream_events(response)
+    assert events[0]["choices"][0]["delta"]["content"] == "Hel"
+    assert events[-1] == {"error": {"message": "provider 'fake' failed", "type": "provider_error"}}
+    assert "[DONE]" not in events
 
 
 def test_empty_messages_fail_validation() -> None:

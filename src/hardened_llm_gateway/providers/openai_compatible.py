@@ -6,7 +6,7 @@ differ only in base URL and key.
 """
 
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from typing import Any
 
 import httpx
@@ -147,7 +147,7 @@ class OpenAICompatibleProvider:
             latency_ms=latency_ms,
         )
 
-    async def stream(self, request: ChatRequest) -> AsyncIterator[ChatChunk]:
+    async def stream(self, request: ChatRequest) -> AsyncGenerator[ChatChunk]:
         """Yield the reply piece by piece, parsed from the provider's server-sent events."""
         payload: dict[str, Any] = request.model_dump(exclude_none=True)
         payload["stream"] = True
