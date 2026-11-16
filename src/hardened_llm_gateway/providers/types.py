@@ -41,6 +41,21 @@ class ChatResponse(BaseModel):
     latency_ms: float
 
 
+class ChatChunk(BaseModel):
+    """One piece of a streamed reply.
+
+    `delta` is the new text in this piece. The last pieces carry `finish_reason`
+    and, if the provider reports it, `usage`.
+    """
+
+    id: str
+    provider: str
+    model: str
+    delta: str = ""
+    finish_reason: str | None = None
+    usage: Usage | None = None
+
+
 class ProviderError(Exception):
     """A provider call failed.
 

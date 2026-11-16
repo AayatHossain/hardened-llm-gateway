@@ -1,5 +1,6 @@
 """Tests for POST /v1/chat/completions, with a fake provider (no network, no keys)."""
 
+from collections.abc import AsyncIterator
 from typing import Any
 
 import pytest
@@ -7,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from hardened_llm_gateway.app import create_app
 from hardened_llm_gateway.providers import (
+    ChatChunk,
     ChatRequest,
     ChatResponse,
     ProviderError,
@@ -18,9 +20,29 @@ MESSAGES = [{"role": "user", "content": "hi"}]
 
 
 class FakeProvider:
-    def __init__(self, error: ProviderError | None = None) -> None:
+    """Answers "Hello!" (streamed as "Hel" + "lo!"), or raises `error`.
+
+    When streaming, the error is raised after `fail_after_chunks` chunks.
+    """
+
+    def __init__(self, error: ProviderError | None = None, fail_after_chunks: int = 0) -> None:
         self.error = error
+        self.fail_after_chunks = fail_after_chunks
         self.requests: list[ChatRequest] = []
+
+    async def stream(self, request: ChatRequest) -> AsyncIterator[ChatChunk]:
+        self.requests.append(request)
+        for index, piece in enumerate(["Hel", "lo!"]):
+            if self.error is not None and index == self.fail_after_chunks:
+                raise self.error
+            yield ChatChunk(id="abc", provider="fake", model=request.model, delta=piece)
+        yield ChatChunk(
+            id="abc",
+            provider="fake",
+            model=request.model,
+            finish_reason="stop",
+            usage=Usage(prompt_tokens=3, completion_tokens=2, total_tokens=5),
+        )
 
     @property
     def name(self) -> str:

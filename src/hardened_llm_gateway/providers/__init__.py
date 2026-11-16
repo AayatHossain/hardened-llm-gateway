@@ -3,6 +3,7 @@
 from hardened_llm_gateway.providers.base import Provider
 from hardened_llm_gateway.providers.openai_compatible import OpenAICompatibleProvider
 from hardened_llm_gateway.providers.types import (
+    ChatChunk,
     ChatMessage,
     ChatRequest,
     ChatResponse,
@@ -12,6 +13,7 @@ from hardened_llm_gateway.providers.types import (
 )
 
 __all__ = [
+    "ChatChunk",
     "ChatMessage",
     "ChatRequest",
     "ChatResponse",
