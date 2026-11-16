@@ -1,4 +1,3 @@
-import os
 from pathlib import Path
 
 import pytest
@@ -6,14 +5,8 @@ from pydantic import ValidationError
 
 from hardened_llm_gateway.config import Settings
 
-
-@pytest.fixture(autouse=True)
-def clean_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Run each test with no GATEWAY_ variables and no .env from the repo."""
-    for name in list(os.environ):
-        if name.startswith("GATEWAY_"):
-            monkeypatch.delenv(name)
-    monkeypatch.chdir(tmp_path)
+# The autouse clean_env fixture in conftest.py removes GATEWAY_ variables and
+# moves each test into an empty folder, so the repo's real .env is never read.
 
 
 def test_defaults_without_any_config() -> None:
