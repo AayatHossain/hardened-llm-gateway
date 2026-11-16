@@ -9,6 +9,7 @@ import pytest
 from pydantic import SecretStr, ValidationError
 
 from hardened_llm_gateway.providers import (
+    ChatChunk,
     ChatMessage,
     ChatRequest,
     OpenAICompatibleProvider,
@@ -153,3 +154,98 @@ async def test_api_key_never_appears_in_errors_or_repr() -> None:
 def test_request_needs_at_least_one_message() -> None:
     with pytest.raises(ValidationError):
         ChatRequest(model="some-model", messages=[])
+
+
+# --- streaming -------------------------------------------------------------
+
+
+def sse(*events: dict[str, Any] | str) -> bytes:
+    """Build a server-sent-events body.
+
+    Dicts become JSON data events, strings starting with ":" are comment lines,
+    other strings are sent as raw data (e.g. "[DONE]").
+    """
+    lines = []
+    for event in events:
+        if isinstance(event, str) and event.startswith(":"):
+            lines.append(f"{event}\n\n")
+            continue
+        data = json.dumps(event) if isinstance(event, dict) else event
+        lines.append(f"data: {data}\n\n")
+    return "".join(lines).encode()
+
+
+def chunk(content: str | None = None, finish: str | None = None, **extra: Any) -> dict[str, Any]:
+    return {
+        "id": "chatcmpl-1",
+        "object": "chat.completion.chunk",
+        "model": "some-model",
+        "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": finish}],
+        **extra,
+    }
+
+
+async def collect(provider: OpenAICompatibleProvider) -> list[ChatChunk]:
+    return [piece async for piece in provider.stream(make_request())]
+
+
+async def test_stream_yields_pieces_in_order() -> None:
+    seen: list[httpx.Request] = []
+    usage = {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}
+    body = sse(
+        chunk("Hel"),
+        ": keep-alive",
+        chunk("lo!"),
+        chunk(finish="stop"),
+        {"id": "chatcmpl-1", "model": "some-model", "choices": [], "usage": usage},
+        "[DONE]",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, content=body, headers={"content-type": "text/event-stream"})
+
+    pieces = await collect(make_provider(handler))
+
+    assert "".join(p.delta for p in pieces) == "Hello!"
+    assert pieces[2].finish_reason == "stop"
+    assert pieces[-1].usage is not None
+    assert pieces[-1].usage.total_tokens == 7
+    assert all(p.provider == "fake" for p in pieces)
+    sent = json.loads(seen[0].content)
+    assert sent["stream"] is True
+    assert sent["stream_options"] == {"include_usage": True}
+
+
+async def test_stream_reads_groq_usage() -> None:
+    usage = {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+    body = sse(chunk("hi", finish="stop", x_groq={"usage": usage}), "[DONE]")
+    pieces = await collect(make_provider(lambda _: httpx.Response(200, content=body)))
+    assert pieces[0].usage is not None
+    assert pieces[0].usage.total_tokens == 2
+
+
+async def test_stream_http_error_is_raised_before_any_piece() -> None:
+    provider = make_provider(
+        lambda _: httpx.Response(429, headers={"retry-after": "3"}, json={"error": "slow down"})
+    )
+    with pytest.raises(ProviderError) as info:
+        await collect(provider)
+    assert info.value.status_code == 429
+    assert info.value.retryable is True
+    assert info.value.retry_after_seconds == 3.0
+
+
+async def test_stream_bad_event_is_an_error() -> None:
+    body = sse(chunk("ok"), "{not json")
+    with pytest.raises(ProviderError) as info:
+        await collect(make_provider(lambda _: httpx.Response(200, content=body)))
+    assert info.value.retryable is False
+
+
+async def test_stream_timeout_is_retryable() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectTimeout("too slow", request=request)
+
+    with pytest.raises(ProviderTimeoutError):
+        await collect(make_provider(handler))
