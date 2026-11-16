@@ -62,3 +62,10 @@ class ProviderError(Exception):
         self.status_code = status_code
         self.retryable = retryable
         self.retry_after_seconds = retry_after_seconds
+
+
+class ProviderTimeoutError(ProviderError):
+    """The provider did not answer within the timeout. Always retryable."""
+
+    def __init__(self, provider: str) -> None:
+        super().__init__(provider, "request timed out", retryable=True)

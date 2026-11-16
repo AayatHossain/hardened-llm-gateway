@@ -7,6 +7,7 @@ from hardened_llm_gateway.providers.types import (
     ChatRequest,
     ChatResponse,
     ProviderError,
+    ProviderTimeoutError,
     Usage,
 )
 
@@ -17,5 +18,6 @@ __all__ = [
     "OpenAICompatibleProvider",
     "Provider",
     "ProviderError",
+    "ProviderTimeoutError",
     "Usage",
 ]
