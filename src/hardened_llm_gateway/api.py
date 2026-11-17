@@ -349,6 +349,7 @@ async def chat_completions(
             raise _to_gateway_error(exc) from None
     except GatewayError as exc:
         trace.finish(exc.status_code, error_type=exc.error_type)
+        exc.headers = {**(exc.headers or {}), "x-gateway-request-id": trace.id}
         raise
 
     cost = prices.cost_usd(str(target), reply.usage)

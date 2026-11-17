@@ -661,3 +661,9 @@ def test_app_writes_the_log_to_the_configured_database(tmp_path: Path) -> None:
         count = connection.execute(select(func.count()).select_from(requests_table)).scalar()
     engine.dispose()
     assert count == 3
+
+
+def test_error_reply_names_its_log_row() -> None:
+    response, row = logged(FakeProvider(UNAVAILABLE), {"model": "fake/m1", "messages": MESSAGES})
+    assert response.status_code == 502
+    assert response.headers["x-gateway-request-id"] == row.id
