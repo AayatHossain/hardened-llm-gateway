@@ -27,6 +27,7 @@ from hardened_llm_gateway.config import Settings
 from hardened_llm_gateway.fallback import Attempt, RetryPolicy, Target, run_with_fallback
 from hardened_llm_gateway.keys import Client, find_client
 from hardened_llm_gateway.models import ModelDirectory
+from hardened_llm_gateway.pricing import PriceTable
 from hardened_llm_gateway.providers import (
     ChatChunk,
     ChatRequest,
@@ -176,6 +177,18 @@ def get_model_directory(request: Request) -> ModelDirectory:
     return directory
 
 
+def get_prices(request: Request) -> PriceTable:
+    prices: PriceTable = request.app.state.prices
+    return prices
+
+
+def _format_cost(cost: float | None) -> str:
+    """USD with up to 8 decimals, e.g. "0.000225"; "unknown" when the model has no price."""
+    if cost is None:
+        return "unknown"
+    return f"{cost:.8f}".rstrip("0").rstrip(".")
+
+
 # Every /v1 route needs a client key and counts against the client's limit. Routes that
 # also take `limits` get the same result: FastAPI runs a dependency once per request.
 router = APIRouter(dependencies=[Depends(enforce_rate_limit)])
@@ -253,6 +266,7 @@ async def chat_completions(
     providers: Annotated[Mapping[str, Provider], Depends(get_providers)],
     settings: Annotated[Settings, Depends(get_gateway_settings)],
     limits: Annotated[RateLimitResult, Depends(enforce_rate_limit)],
+    prices: Annotated[PriceTable, Depends(get_prices)],
 ) -> ChatCompletion | StreamingResponse:
     targets = _targets(body, providers, settings)
     base = ChatRequest.model_validate(body.model_dump(exclude={"stream"}))
@@ -262,7 +276,7 @@ async def chat_completions(
         return base.model_copy(update={"model": target.model})
 
     if body.stream:
-        return await _stream(targets, providers, policy, request_for, limits.headers())
+        return await _stream(targets, providers, policy, request_for, limits.headers(), prices)
 
     async def call(provider: Provider, target: Target) -> ChatResponse:
         return await provider.chat(request_for(target))
@@ -275,6 +289,7 @@ async def chat_completions(
     response.headers.update(limits.headers())
     response.headers.update(_decision_headers(target, attempts))
     response.headers["x-gateway-latency-ms"] = f"{reply.latency_ms:.0f}"
+    response.headers["x-gateway-cost-usd"] = _format_cost(prices.cost_usd(str(target), reply.usage))
     return ChatCompletion(
         id=reply.id or f"chatcmpl-{uuid.uuid4().hex}",
         created=int(time.time()),
@@ -302,8 +317,12 @@ async def _stream(
     policy: RetryPolicy,
     request_for: Callable[[Target], ChatRequest],
     extra_headers: dict[str, str],
+    prices: PriceTable,
 ) -> StreamingResponse:
     """Stream the reply as OpenAI chat.completion.chunk events, ending with [DONE].
+
+    The cost is only known at the end, after the headers were sent, so it travels in
+    the event that carries `usage`, as "x_gateway": {"cost_usd": ...} (like Groq's x_groq).
 
     Opening a stream means waiting for its first chunk. Retries and fallback apply
     until then, so failures before any text (rate limit, timeout, bad model) are
@@ -346,6 +365,8 @@ async def _stream(
         }
         if chunk.usage is not None:
             payload["usage"] = chunk.usage.model_dump()
+            cost = prices.cost_usd(str(target), chunk.usage)
+            payload["x_gateway"] = {"cost_usd": cost}
         return _sse(payload)
 
     async def events() -> AsyncIterator[str]:

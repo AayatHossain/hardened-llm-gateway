@@ -11,6 +11,7 @@ from hardened_llm_gateway import __version__
 from hardened_llm_gateway.api import GatewayError, gateway_error_handler, router
 from hardened_llm_gateway.config import Settings, get_settings
 from hardened_llm_gateway.models import ModelDirectory
+from hardened_llm_gateway.pricing import PriceTable
 from hardened_llm_gateway.providers import Provider
 from hardened_llm_gateway.providers.catalog import build_providers
 from hardened_llm_gateway.ratelimit import RateLimiter
@@ -21,11 +22,13 @@ logger = logging.getLogger(__name__)
 def create_app(
     settings: Settings | None = None,
     providers: Mapping[str, Provider] | None = None,
+    prices: PriceTable | None = None,
 ) -> FastAPI:
     """Build a new gateway app. Used by uvicorn with --factory and by tests.
 
     Tests pass `providers` directly; otherwise they are built from settings at startup,
-    sharing one HTTP client that is closed on shutdown.
+    sharing one HTTP client that is closed on shutdown. `prices` defaults to the
+    shipped prices.toml.
     """
     resolved_settings = settings or get_settings()
     if not resolved_settings.clients:
@@ -46,6 +49,7 @@ def create_app(
     app.state.settings = resolved_settings
     app.state.rate_limiter = RateLimiter()
     app.state.model_directory = ModelDirectory()
+    app.state.prices = prices if prices is not None else PriceTable.load()
     app.add_exception_handler(GatewayError, gateway_error_handler)
     app.include_router(router)
 

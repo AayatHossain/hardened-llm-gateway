@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 from hardened_llm_gateway.app import create_app
 from hardened_llm_gateway.config import Settings
 from hardened_llm_gateway.keys import hash_key
+from hardened_llm_gateway.pricing import ModelPrice, PriceTable
 from hardened_llm_gateway.providers import (
     ChatChunk,
     ChatRequest,
@@ -86,6 +87,8 @@ class FakeProvider:
 
 
 KEY = "gw-test-key"
+# fake/m1 is priced (1 USD in, 2 USD out per 1M tokens); backup/m2 is not.
+PRICES = PriceTable({"fake/m1": ModelPrice(input=1.0, output=2.0)})
 BASE_SETTINGS: dict[str, Any] = {
     "clients": {"tests": {"key_sha256": hash_key(KEY)}},
     # No real waiting in tests: zero backoff, and any Retry-After is "too long" (use a fallback).
@@ -102,7 +105,9 @@ def post(
     **settings: Any,
 ) -> Any:
     providers = {p.name: p for p in (provider, *others)}
-    app = create_app(settings=Settings(**{**BASE_SETTINGS, **settings}), providers=providers)
+    app = create_app(
+        settings=Settings(**{**BASE_SETTINGS, **settings}), providers=providers, prices=PRICES
+    )
     headers = {"authorization": f"Bearer {key}"} if key is not None else {}
     with TestClient(app) as client:
         return client.post("/v1/chat/completions", json=body, headers=headers)
@@ -139,7 +144,9 @@ def test_health_needs_no_key() -> None:
 
 
 def get_models(*providers: FakeProvider, key: str | None = KEY) -> Any:
-    app = create_app(settings=Settings(**BASE_SETTINGS), providers={p.name: p for p in providers})
+    app = create_app(
+        settings=Settings(**BASE_SETTINGS), providers={p.name: p for p in providers}, prices=PRICES
+    )
     headers = {"authorization": f"Bearer {key}"} if key is not None else {}
     with TestClient(app) as client:
         return client.get("/v1/models", headers=headers)
@@ -440,6 +447,7 @@ async def sdk(
     app = create_app(
         settings=Settings(**{**BASE_SETTINGS, **settings}),
         providers={p.name: p for p in providers},
+        prices=PRICES,
     )
     async with (
         app.router.lifespan_context(app),
@@ -506,3 +514,40 @@ async def test_sdk_raises_its_usual_exceptions() -> None:
         await client.chat.completions.create(model="fake/m1", messages=message)
         with pytest.raises(openai.RateLimitError):
             await client.chat.completions.create(model="fake/m1", messages=message)
+
+
+# --- cost ---------------------------------------------------------------------
+
+# FakeProvider reports 3 prompt and 2 completion tokens: 3 x 1 + 2 x 2 = 7 USD per 1M.
+
+
+def test_reply_cost_is_in_a_header() -> None:
+    response = post(FakeProvider(), {"model": "fake/m1", "messages": MESSAGES})
+    assert response.headers["x-gateway-cost-usd"] == "0.000007"
+
+
+def test_unpriced_model_cost_is_unknown_not_zero() -> None:
+    primary = FakeProvider(UNAVAILABLE)
+    backup = FakeProvider(name="backup")
+    response = post(primary, {"model": "fake/m1", "messages": MESSAGES}, backup, **FALLBACK)
+    assert response.headers["x-gateway-target"] == "backup/m2"
+    assert response.headers["x-gateway-cost-usd"] == "unknown"
+
+
+def test_streamed_cost_comes_with_the_usage_event() -> None:
+    response = post(FakeProvider(), {"model": "fake/m1", "messages": MESSAGES, "stream": True})
+    chunks = stream_events(response)[:-1]
+    assert "x_gateway" not in chunks[0]
+    assert chunks[-1]["usage"]["total_tokens"] == 5
+    assert chunks[-1]["x_gateway"]["cost_usd"] == pytest.approx(0.000007)
+
+
+@pytest.mark.anyio
+async def test_sdk_accepts_the_extra_cost_field() -> None:
+    async with sdk(FakeProvider()) as client:
+        stream = await client.chat.completions.create(
+            model="fake/m1", messages=[{"role": "user", "content": "hi"}], stream=True
+        )
+        chunks = [chunk async for chunk in stream]
+    extra = chunks[-1].model_extra or {}
+    assert extra["x_gateway"]["cost_usd"] == pytest.approx(0.000007)
