@@ -25,6 +25,7 @@ def create_app(
     Tests pass `providers` directly; otherwise they are built from settings at startup,
     sharing one HTTP client that is closed on shutdown.
     """
+    resolved_settings = settings or get_settings()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -33,11 +34,12 @@ def create_app(
             yield
             return
         async with httpx.AsyncClient() as client:
-            app.state.providers = build_providers(settings or get_settings(), client)
+            app.state.providers = build_providers(resolved_settings, client)
             logger.info("enabled providers: %s", ", ".join(app.state.providers) or "none")
             yield
 
     app = FastAPI(title="Hardened LLM Gateway", version=__version__, lifespan=lifespan)
+    app.state.settings = resolved_settings
     app.add_exception_handler(GatewayError, gateway_error_handler)
     app.include_router(router)
 

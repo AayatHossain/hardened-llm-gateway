@@ -3,6 +3,9 @@
 Clients send model="<provider>/<model>", e.g. "groq/openai/gpt-oss-20b".
 Replies and errors use the OpenAI format, so OpenAI client libraries work unchanged,
 including streaming (stream=true returns server-sent events).
+
+Each request is retried and, if configured, sent to fallback targets when the
+requested provider keeps failing (see fallback.py).
 """
 
 import json
@@ -10,16 +13,19 @@ import logging
 import math
 import time
 import uuid
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
+from hardened_llm_gateway.config import Settings
+from hardened_llm_gateway.fallback import Attempt, RetryPolicy, Target, run_with_fallback
 from hardened_llm_gateway.providers import (
     ChatChunk,
     ChatRequest,
+    ChatResponse,
     Provider,
     ProviderError,
     ProviderTimeoutError,
@@ -87,6 +93,11 @@ def get_providers(request: Request) -> Mapping[str, Provider]:
     return providers
 
 
+def get_gateway_settings(request: Request) -> Settings:
+    settings: Settings = request.app.state.settings
+    return settings
+
+
 def _to_gateway_error(exc: ProviderError) -> GatewayError:
     """Map a provider failure to what the client sees. Details stay in the server log."""
     name = exc.provider
@@ -105,27 +116,35 @@ def _to_gateway_error(exc: ProviderError) -> GatewayError:
     return GatewayError(502, f"provider {name!r} failed", "provider_error")
 
 
-def _resolve(
-    body: ChatCompletionRequest, providers: Mapping[str, Provider]
-) -> tuple[Provider, ChatRequest]:
-    """Split "<provider>/<model>" and return the provider plus the request it should get."""
-    provider_name, _, model = body.model.partition("/")
-    if not model:
+def _targets(
+    body: ChatCompletionRequest, providers: Mapping[str, Provider], settings: Settings
+) -> list[Target]:
+    """The requested target first, then its configured fallbacks."""
+    primary = Target.parse(body.model)
+    if primary is None:
         raise GatewayError(
             400,
             'model must be "<provider>/<model>", e.g. "groq/openai/gpt-oss-20b"',
             "invalid_request_error",
         )
-    provider = providers.get(provider_name)
-    if provider is None:
+    if primary.provider not in providers:
         enabled = ", ".join(sorted(providers)) or "none"
         raise GatewayError(
             400,
-            f"provider {provider_name!r} is unknown or has no API key (enabled: {enabled})",
+            f"provider {primary.provider!r} is unknown or has no API key (enabled: {enabled})",
             "invalid_request_error",
         )
-    request = ChatRequest.model_validate({**body.model_dump(exclude={"stream"}), "model": model})
-    return provider, request
+    backups = [Target.parse(value) for value in settings.fallbacks.get(body.model, [])]
+    return [primary, *(t for t in backups if t is not None and t != primary)]
+
+
+def _decision_headers(target: Target, attempts: list[Attempt]) -> dict[str, str]:
+    """Headers that explain which target answered and how many tries it took."""
+    return {
+        "x-gateway-provider": target.provider,
+        "x-gateway-target": str(target),
+        "x-gateway-attempts": str(len(attempts)),
+    }
 
 
 @router.post("/v1/chat/completions", response_model=ChatCompletion)
@@ -133,18 +152,27 @@ async def chat_completions(
     body: ChatCompletionRequest,
     response: Response,
     providers: Annotated[Mapping[str, Provider], Depends(get_providers)],
+    settings: Annotated[Settings, Depends(get_gateway_settings)],
 ) -> ChatCompletion | StreamingResponse:
-    provider, request = _resolve(body, providers)
+    targets = _targets(body, providers, settings)
+    base = ChatRequest.model_validate(body.model_dump(exclude={"stream"}))
+    policy = RetryPolicy.from_settings(settings)
+
+    def request_for(target: Target) -> ChatRequest:
+        return base.model_copy(update={"model": target.model})
+
     if body.stream:
-        return await _stream(provider, request, body.model)
+        return await _stream(targets, providers, policy, request_for)
+
+    async def call(provider: Provider, target: Target) -> ChatResponse:
+        return await provider.chat(request_for(target))
 
     try:
-        reply = await provider.chat(request)
+        reply, target, attempts = await run_with_fallback(targets, providers, call, policy)
     except ProviderError as exc:
-        logger.warning("provider call failed: %s", exc)
         raise _to_gateway_error(exc) from None
 
-    response.headers["x-gateway-provider"] = reply.provider
+    response.headers.update(_decision_headers(target, attempts))
     response.headers["x-gateway-latency-ms"] = f"{reply.latency_ms:.0f}"
     return ChatCompletion(
         id=reply.id or f"chatcmpl-{uuid.uuid4().hex}",
@@ -164,23 +192,39 @@ def _sse(payload: dict[str, Any]) -> str:
     return f"data: {json.dumps(payload, separators=(',', ':'))}\n\n"
 
 
-async def _stream(provider: Provider, request: ChatRequest, model: str) -> StreamingResponse:
+type _OpenedStream = tuple[AsyncGenerator[ChatChunk], ChatChunk | None]
+
+
+async def _stream(
+    targets: list[Target],
+    providers: Mapping[str, Provider],
+    policy: RetryPolicy,
+    request_for: Callable[[Target], ChatRequest],
+) -> StreamingResponse:
     """Stream the reply as OpenAI chat.completion.chunk events, ending with [DONE].
 
-    The first chunk is awaited before responding, so failures that happen before any
-    text (rate limit, timeout, bad model) still get a proper HTTP status. A failure after
-    that can only be reported as an error event inside the stream.
+    Opening a stream means waiting for its first chunk. Retries and fallback apply
+    until then, so failures before any text (rate limit, timeout, bad model) are
+    handled like non-streamed calls. A failure after that can only be reported as an
+    error event inside the stream.
     """
     started = time.perf_counter()
-    chunks = provider.stream(request)
-    first: ChatChunk | None
+
+    async def open_stream(provider: Provider, target: Target) -> _OpenedStream:
+        chunks = provider.stream(request_for(target))
+        try:
+            return chunks, await anext(chunks)
+        except StopAsyncIteration:
+            return chunks, None
+        except BaseException:
+            await chunks.aclose()
+            raise
+
     try:
-        first = await anext(chunks)
-    except StopAsyncIteration:
-        first = None
+        (chunks, first), target, attempts = await run_with_fallback(
+            targets, providers, open_stream, policy
+        )
     except ProviderError as exc:
-        logger.warning("provider stream failed before the first chunk: %s", exc)
-        await chunks.aclose()
         raise _to_gateway_error(exc) from None
     first_chunk_ms = (time.perf_counter() - started) * 1000
 
@@ -195,7 +239,7 @@ async def _stream(provider: Provider, request: ChatRequest, model: str) -> Strea
             "id": completion_id,
             "object": "chat.completion.chunk",
             "created": created,
-            "model": model,
+            "model": str(target),
             "choices": [{"index": 0, "delta": delta, "finish_reason": chunk.finish_reason}],
         }
         if chunk.usage is not None:
@@ -220,7 +264,7 @@ async def _stream(provider: Provider, request: ChatRequest, model: str) -> Strea
         events(),
         media_type="text/event-stream",
         headers={
-            "x-gateway-provider": provider.name,
+            **_decision_headers(target, attempts),
             "x-gateway-first-chunk-ms": f"{first_chunk_ms:.0f}",
             "cache-control": "no-cache",
         },
