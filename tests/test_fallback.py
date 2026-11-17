@@ -4,7 +4,7 @@ from collections.abc import AsyncGenerator
 
 import pytest
 
-from hardened_llm_gateway.fallback import RetryPolicy, Target, run_with_fallback
+from hardened_llm_gateway.fallback import Attempt, RetryPolicy, Target, run_with_fallback
 from hardened_llm_gateway.providers import (
     ChatChunk,
     ChatMessage,
@@ -182,3 +182,16 @@ def test_backoff_grows_and_is_capped() -> None:
 )
 def test_target_parse(value: str, expected: Target | None) -> None:
     assert Target.parse(value) == expected
+
+
+async def test_attempts_list_is_filled_even_when_everything_fails() -> None:
+    a = ScriptedProvider("a", [ProviderError("a", "HTTP 401", status_code=401)])
+    attempts: list[Attempt] = []
+
+    async def call(provider: Provider, target: Target) -> ChatResponse:
+        message = ChatMessage(role="user", content="hi")
+        return await provider.chat(ChatRequest(model=target.model, messages=[message]))
+
+    with pytest.raises(ProviderError):
+        await run_with_fallback([A], {"a": a}, call, POLICY, attempts=attempts)
+    assert attempts == [Attempt(A, "HTTP 401")]

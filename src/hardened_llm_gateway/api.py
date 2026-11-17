@@ -10,6 +10,8 @@ Each request is retried and, if configured, sent to fallback targets when the
 requested provider keeps failing (see fallback.py).
 """
 
+import dataclasses
+import datetime
 import json
 import logging
 import math
@@ -38,6 +40,7 @@ from hardened_llm_gateway.providers import (
     Usage,
 )
 from hardened_llm_gateway.ratelimit import RateLimiter, RateLimitResult
+from hardened_llm_gateway.requestlog import RequestRecord, RequestRecorder
 
 logger = logging.getLogger(__name__)
 
@@ -259,6 +262,57 @@ def _decision_headers(target: Target, attempts: list[Attempt]) -> dict[str, str]
     }
 
 
+def get_request_log(request: Request) -> RequestRecorder:
+    request_log: RequestRecorder = request.app.state.request_log
+    return request_log
+
+
+@dataclasses.dataclass
+class _Trace:
+    """What the request log needs, collected while 1 chat request runs."""
+
+    log: RequestRecorder
+    client: str
+    requested_model: str
+    stream: bool
+    id: str = dataclasses.field(default_factory=lambda: f"req-{uuid.uuid4().hex}")
+    created_at: datetime.datetime = dataclasses.field(
+        default_factory=lambda: datetime.datetime.now(datetime.UTC)
+    )
+    started: float = dataclasses.field(default_factory=time.perf_counter)
+    attempts: list[Attempt] = dataclasses.field(default_factory=list)  # filled by the fallback
+
+    def finish(
+        self,
+        status_code: int,
+        *,
+        error_type: str | None = None,
+        usage: Usage | None = None,
+        cost_usd: float | None = None,
+        first_chunk_ms: float | None = None,
+    ) -> None:
+        last = self.attempts[-1].target if self.attempts else None
+        self.log.record(
+            RequestRecord(
+                id=self.id,
+                created_at=self.created_at,
+                client=self.client,
+                requested_model=self.requested_model,
+                target=str(last) if last else None,
+                provider=last.provider if last else None,
+                stream=self.stream,
+                status_code=status_code,
+                error_type=error_type,
+                attempts=len(self.attempts),
+                prompt_tokens=usage.prompt_tokens if usage else None,
+                completion_tokens=usage.completion_tokens if usage else None,
+                cost_usd=cost_usd,
+                latency_ms=(time.perf_counter() - self.started) * 1000,
+                first_chunk_ms=first_chunk_ms,
+            )
+        )
+
+
 @router.post("/v1/chat/completions", response_model=ChatCompletion)
 async def chat_completions(
     body: ChatCompletionRequest,
@@ -267,29 +321,44 @@ async def chat_completions(
     settings: Annotated[Settings, Depends(get_gateway_settings)],
     limits: Annotated[RateLimitResult, Depends(enforce_rate_limit)],
     prices: Annotated[PriceTable, Depends(get_prices)],
+    client: Annotated[Client, Depends(authenticate)],
+    request_log: Annotated[RequestRecorder, Depends(get_request_log)],
 ) -> ChatCompletion | StreamingResponse:
-    targets = _targets(body, providers, settings)
-    base = ChatRequest.model_validate(body.model_dump(exclude={"stream"}))
-    policy = RetryPolicy.from_settings(settings)
-
-    def request_for(target: Target) -> ChatRequest:
-        return base.model_copy(update={"model": target.model})
-
-    if body.stream:
-        return await _stream(targets, providers, policy, request_for, limits.headers(), prices)
-
-    async def call(provider: Provider, target: Target) -> ChatResponse:
-        return await provider.chat(request_for(target))
-
+    """Every request that gets past the key check and rate limit is written to the log."""
+    trace = _Trace(request_log, client.name, body.model, body.stream)
     try:
-        reply, target, attempts = await run_with_fallback(targets, providers, call, policy)
-    except ProviderError as exc:
-        raise _to_gateway_error(exc) from None
+        targets = _targets(body, providers, settings)
+        base = ChatRequest.model_validate(body.model_dump(exclude={"stream"}))
+        policy = RetryPolicy.from_settings(settings)
+
+        def request_for(target: Target) -> ChatRequest:
+            return base.model_copy(update={"model": target.model})
+
+        if body.stream:
+            headers = {**limits.headers(), "x-gateway-request-id": trace.id}
+            return await _stream(targets, providers, policy, request_for, headers, prices, trace)
+
+        async def call(provider: Provider, target: Target) -> ChatResponse:
+            return await provider.chat(request_for(target))
+
+        try:
+            reply, target, attempts = await run_with_fallback(
+                targets, providers, call, policy, attempts=trace.attempts
+            )
+        except ProviderError as exc:
+            raise _to_gateway_error(exc) from None
+    except GatewayError as exc:
+        trace.finish(exc.status_code, error_type=exc.error_type)
+        raise
+
+    cost = prices.cost_usd(str(target), reply.usage)
+    trace.finish(200, usage=reply.usage, cost_usd=cost)
 
     response.headers.update(limits.headers())
     response.headers.update(_decision_headers(target, attempts))
+    response.headers["x-gateway-request-id"] = trace.id
     response.headers["x-gateway-latency-ms"] = f"{reply.latency_ms:.0f}"
-    response.headers["x-gateway-cost-usd"] = _format_cost(prices.cost_usd(str(target), reply.usage))
+    response.headers["x-gateway-cost-usd"] = _format_cost(cost)
     return ChatCompletion(
         id=reply.id or f"chatcmpl-{uuid.uuid4().hex}",
         created=int(time.time()),
@@ -318,6 +387,7 @@ async def _stream(
     request_for: Callable[[Target], ChatRequest],
     extra_headers: dict[str, str],
     prices: PriceTable,
+    trace: _Trace,
 ) -> StreamingResponse:
     """Stream the reply as OpenAI chat.completion.chunk events, ending with [DONE].
 
@@ -343,7 +413,7 @@ async def _stream(
 
     try:
         (chunks, first), target, attempts = await run_with_fallback(
-            targets, providers, open_stream, policy
+            targets, providers, open_stream, policy, attempts=trace.attempts
         )
     except ProviderError as exc:
         raise _to_gateway_error(exc) from None
@@ -370,17 +440,31 @@ async def _stream(
         return _sse(payload)
 
     async def events() -> AsyncIterator[str]:
+        usage = first.usage if first else None
+        error_type: str | None = "client_disconnected"  # until the reply ends normally
         try:
             if first is not None:
                 yield event(first, with_role=True)
             async for chunk in chunks:
+                usage = chunk.usage or usage
                 yield event(chunk, with_role=False)
+            error_type = None
         except ProviderError as exc:
             logger.warning("provider stream failed mid-reply: %s", exc)
-            yield _sse(_to_gateway_error(exc).body())
+            failure = _to_gateway_error(exc)
+            error_type = failure.error_type
+            yield _sse(failure.body())
             return
         finally:
             await chunks.aclose()  # also runs when the client disconnects early
+            # The client already got status 200 with the headers, whatever happened next.
+            trace.finish(
+                200,
+                error_type=error_type,
+                usage=usage,
+                cost_usd=prices.cost_usd(str(target), usage) if usage else None,
+                first_chunk_ms=first_chunk_ms,
+            )
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(

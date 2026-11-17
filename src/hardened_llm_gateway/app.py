@@ -2,7 +2,7 @@
 
 import logging
 from collections.abc import AsyncIterator, Mapping
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 
 import httpx
 from fastapi import FastAPI
@@ -15,6 +15,7 @@ from hardened_llm_gateway.pricing import PriceTable
 from hardened_llm_gateway.providers import Provider
 from hardened_llm_gateway.providers.catalog import build_providers
 from hardened_llm_gateway.ratelimit import RateLimiter
+from hardened_llm_gateway.requestlog import NullRequestLog, RequestLog, RequestRecorder
 
 logger = logging.getLogger(__name__)
 
@@ -23,12 +24,14 @@ def create_app(
     settings: Settings | None = None,
     providers: Mapping[str, Provider] | None = None,
     prices: PriceTable | None = None,
+    request_log: RequestRecorder | None = None,
 ) -> FastAPI:
     """Build a new gateway app. Used by uvicorn with --factory and by tests.
 
-    Tests pass `providers` directly; otherwise they are built from settings at startup,
-    sharing one HTTP client that is closed on shutdown. `prices` defaults to the
-    shipped prices.toml.
+    Tests pass `providers` and `request_log` directly. Otherwise, at startup, providers
+    are built from settings and share one HTTP client, and the request log opens the
+    database at GATEWAY_REQUEST_LOG_URL; both are closed on shutdown. `prices` defaults
+    to the shipped prices.toml.
     """
     resolved_settings = settings or get_settings()
     if not resolved_settings.clients:
@@ -36,13 +39,23 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        if providers is not None:
-            app.state.providers = providers
-            yield
-            return
-        async with httpx.AsyncClient() as client:
-            app.state.providers = build_providers(resolved_settings, client)
-            logger.info("enabled providers: %s", ", ".join(app.state.providers) or "none")
+        async with AsyncExitStack() as stack:
+            if request_log is not None:
+                app.state.request_log = request_log
+            elif resolved_settings.request_log_url:
+                log = RequestLog(resolved_settings.request_log_url)
+                await log.start()
+                stack.push_async_callback(log.close)  # writes what is still queued
+                app.state.request_log = log
+            else:
+                app.state.request_log = NullRequestLog()
+
+            if providers is not None:
+                app.state.providers = providers
+            else:
+                client = await stack.enter_async_context(httpx.AsyncClient())
+                app.state.providers = build_providers(resolved_settings, client)
+                logger.info("enabled providers: %s", ", ".join(app.state.providers) or "none")
             yield
 
     app = FastAPI(title="Hardened LLM Gateway", version=__version__, lifespan=lifespan)

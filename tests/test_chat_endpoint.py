@@ -6,12 +6,14 @@ The last section drives the gateway with the official OpenAI Python SDK.
 import json
 from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 import httpx2
 import openai
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import create_engine, func, select
 
 from hardened_llm_gateway.app import create_app
 from hardened_llm_gateway.config import Settings
@@ -25,6 +27,7 @@ from hardened_llm_gateway.providers import (
     ProviderTimeoutError,
     Usage,
 )
+from hardened_llm_gateway.requestlog import RequestRecord, requests_table
 
 MESSAGES = [{"role": "user", "content": "hi"}]
 
@@ -94,7 +97,16 @@ BASE_SETTINGS: dict[str, Any] = {
     # No real waiting in tests: zero backoff, and any Retry-After is "too long" (use a fallback).
     "retry_backoff_seconds": 0,
     "max_retry_wait_seconds": 0,
+    "request_log_url": "",  # no database; tests that check the log pass a MemoryLog
 }
+
+
+class MemoryLog:
+    def __init__(self) -> None:
+        self.records: list[RequestRecord] = []
+
+    def record(self, entry: RequestRecord) -> None:
+        self.records.append(entry)
 
 
 def post(
@@ -102,11 +114,15 @@ def post(
     body: dict[str, Any],
     *others: FakeProvider,
     key: str | None = KEY,
+    log: MemoryLog | None = None,
     **settings: Any,
 ) -> Any:
     providers = {p.name: p for p in (provider, *others)}
     app = create_app(
-        settings=Settings(**{**BASE_SETTINGS, **settings}), providers=providers, prices=PRICES
+        settings=Settings(**{**BASE_SETTINGS, **settings}),
+        providers=providers,
+        prices=PRICES,
+        request_log=log,
     )
     headers = {"authorization": f"Bearer {key}"} if key is not None else {}
     with TestClient(app) as client:
@@ -551,3 +567,97 @@ async def test_sdk_accepts_the_extra_cost_field() -> None:
         chunks = [chunk async for chunk in stream]
     extra = chunks[-1].model_extra or {}
     assert extra["x_gateway"]["cost_usd"] == pytest.approx(0.000007)
+
+
+# --- request log --------------------------------------------------------------
+
+
+def logged(*args: Any, **kwargs: Any) -> tuple[Any, RequestRecord]:
+    """Send 1 request with post() and return the response and its single log row."""
+    log = MemoryLog()
+    response = post(*args, log=log, **kwargs)
+    assert len(log.records) == 1
+    return response, log.records[0]
+
+
+def test_successful_request_is_logged() -> None:
+    response, row = logged(FakeProvider(), {"model": "fake/m1", "messages": MESSAGES})
+    assert row.id == response.headers["x-gateway-request-id"]
+    assert (row.client, row.requested_model, row.target, row.provider) == (
+        "tests",
+        "fake/m1",
+        "fake/m1",
+        "fake",
+    )
+    assert (row.status_code, row.error_type, row.attempts, row.stream) == (200, None, 1, False)
+    assert (row.prompt_tokens, row.completion_tokens) == (3, 2)
+    assert row.cost_usd == pytest.approx(0.000007)
+    assert row.latency_ms > 0
+    assert row.created_at.tzinfo is not None
+
+
+def test_fallback_is_logged_with_the_target_that_answered() -> None:
+    _, row = logged(
+        FakeProvider(UNAVAILABLE),
+        {"model": "fake/m1", "messages": MESSAGES},
+        FakeProvider(name="backup"),
+        **FALLBACK,
+    )
+    assert (row.target, row.attempts, row.cost_usd) == ("backup/m2", 3, None)
+
+
+def test_provider_failure_is_logged() -> None:
+    _, row = logged(FakeProvider(UNAVAILABLE), {"model": "fake/m1", "messages": MESSAGES})
+    assert (row.status_code, row.error_type) == (502, "provider_error")
+    assert (row.target, row.attempts, row.prompt_tokens) == ("fake/m1", 2, None)
+
+
+def test_bad_model_name_is_logged_without_attempts() -> None:
+    _, row = logged(FakeProvider(), {"model": "nope/m1", "messages": MESSAGES})
+    assert (row.status_code, row.error_type) == (400, "invalid_request_error")
+    assert (row.target, row.attempts) == (None, 0)
+
+
+def test_streamed_request_is_logged_when_it_ends() -> None:
+    response, row = logged(
+        FakeProvider(), {"model": "fake/m1", "messages": MESSAGES, "stream": True}
+    )
+    assert row.id == response.headers["x-gateway-request-id"]
+    assert (row.stream, row.status_code, row.error_type) == (True, 200, None)
+    assert (row.prompt_tokens, row.completion_tokens) == (3, 2)
+    assert row.cost_usd == pytest.approx(0.000007)
+    assert row.first_chunk_ms is not None
+
+
+def test_stream_failing_mid_reply_is_logged_as_an_error() -> None:
+    error = ProviderError("fake", "network error: ReadError", retryable=True)
+    _, row = logged(
+        FakeProvider(error, fail_after_chunks=1),
+        {"model": "fake/m1", "messages": MESSAGES, "stream": True},
+    )
+    assert (row.status_code, row.error_type, row.prompt_tokens) == (200, "provider_error", None)
+
+
+def test_rejected_key_is_not_logged() -> None:
+    log = MemoryLog()
+    post(FakeProvider(), {"model": "fake/m1", "messages": MESSAGES}, key="gw-wrong", log=log)
+    assert log.records == []
+
+
+def test_app_writes_the_log_to_the_configured_database(tmp_path: Path) -> None:
+    path = tmp_path / "gateway.db"
+    settings = {**BASE_SETTINGS, "request_log_url": f"sqlite+aiosqlite:///{path}"}
+    app = create_app(settings=Settings(**settings), providers={"fake": FakeProvider()})
+    headers = {"authorization": f"Bearer {KEY}"}
+    with TestClient(app) as client:  # leaving the block runs shutdown, which flushes the log
+        for _ in range(3):
+            client.post(
+                "/v1/chat/completions",
+                json={"model": "fake/m1", "messages": MESSAGES},
+                headers=headers,
+            )
+    engine = create_engine(f"sqlite:///{path}")
+    with engine.connect() as connection:
+        count = connection.execute(select(func.count()).select_from(requests_table)).scalar()
+    engine.dispose()
+    assert count == 3

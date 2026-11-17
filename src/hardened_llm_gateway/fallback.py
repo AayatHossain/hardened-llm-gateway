@@ -80,13 +80,15 @@ async def run_with_fallback[T](
     call: Callable[[Provider, Target], Awaitable[T]],
     policy: RetryPolicy,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    attempts: list[Attempt] | None = None,
 ) -> tuple[T, Target, list[Attempt]]:
     """Call targets in order until one succeeds.
 
     Returns the result, the target that produced it and every attempt made.
-    If all targets fail, the last ProviderError is raised.
+    If all targets fail, the last ProviderError is raised. Pass `attempts` to keep the
+    list of attempts in that case too: it is filled in as the attempts happen.
     """
-    attempts: list[Attempt] = []
+    attempts = [] if attempts is None else attempts
     last_error: ProviderError | None = None
     for target in targets:
         provider = providers.get(target.provider)
