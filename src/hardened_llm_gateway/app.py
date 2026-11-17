@@ -12,6 +12,7 @@ from hardened_llm_gateway.api import GatewayError, gateway_error_handler, router
 from hardened_llm_gateway.config import Settings, get_settings
 from hardened_llm_gateway.providers import Provider
 from hardened_llm_gateway.providers.catalog import build_providers
+from hardened_llm_gateway.ratelimit import RateLimiter
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +27,8 @@ def create_app(
     sharing one HTTP client that is closed on shutdown.
     """
     resolved_settings = settings or get_settings()
+    if not resolved_settings.clients:
+        logger.warning("no clients configured (GATEWAY_CLIENTS): every /v1 request will get 401")
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -40,6 +43,7 @@ def create_app(
 
     app = FastAPI(title="Hardened LLM Gateway", version=__version__, lifespan=lifespan)
     app.state.settings = resolved_settings
+    app.state.rate_limiter = RateLimiter()
     app.add_exception_handler(GatewayError, gateway_error_handler)
     app.include_router(router)
 

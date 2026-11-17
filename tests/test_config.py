@@ -73,3 +73,37 @@ def test_rejects_too_many_retries(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GATEWAY_MAX_RETRIES", "10")
     with pytest.raises(ValidationError):
         Settings()
+
+
+HASH_A = "a" * 64
+HASH_B = "b" * 64
+
+
+def test_no_clients_by_default() -> None:
+    assert Settings().clients == {}
+
+
+def test_reads_clients_as_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(
+        "GATEWAY_CLIENTS",
+        f'{{"web": {{"key_sha256": "{HASH_A}", "requests_per_minute": 20}},'
+        f' "cli": {{"key_sha256": "{HASH_B}"}}}}',
+    )
+    clients = Settings().clients
+    assert clients["web"].requests_per_minute == 20
+    assert clients["cli"].requests_per_minute == 60  # the default
+
+
+@pytest.mark.parametrize(
+    "clients",
+    [
+        '{"web": {"key_sha256": "not-a-hash"}}',
+        f'{{"web": {{"key_sha256": "{HASH_A}", "requests_per_minute": 0}}}}',
+        f'{{"web": {{"key_sha256": "{HASH_A}"}}, "cli": {{"key_sha256": "{HASH_A}"}}}}',
+    ],
+    ids=["bad-hash", "zero-limit", "shared-key"],
+)
+def test_rejects_bad_clients(monkeypatch: pytest.MonkeyPatch, clients: str) -> None:
+    monkeypatch.setenv("GATEWAY_CLIENTS", clients)
+    with pytest.raises(ValidationError):
+        Settings()
