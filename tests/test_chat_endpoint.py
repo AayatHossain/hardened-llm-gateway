@@ -38,6 +38,7 @@ class FakeProvider:
         self.fail_after_chunks = fail_after_chunks
         self._name = name
         self.requests: list[ChatRequest] = []
+        self.model_list_calls = 0
 
     async def stream(self, request: ChatRequest) -> AsyncGenerator[ChatChunk]:
         self.requests.append(request)
@@ -56,6 +57,12 @@ class FakeProvider:
     @property
     def name(self) -> str:
         return self._name
+
+    async def list_models(self) -> list[str]:
+        self.model_list_calls += 1
+        if self.error is not None:
+            raise self.error
+        return ["m1", "m2"]
 
     async def chat(self, request: ChatRequest) -> ChatResponse:
         self.requests.append(request)

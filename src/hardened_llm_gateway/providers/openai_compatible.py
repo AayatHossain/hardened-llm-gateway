@@ -1,8 +1,8 @@
 """One adapter for every provider that speaks the OpenAI chat format.
 
 Groq, Gemini (OpenAI-compatible endpoint), NVIDIA NIM and OpenRouter all accept
-POST {base_url}/chat/completions with a Bearer key, so they share this code and
-differ only in base URL and key.
+POST {base_url}/chat/completions and GET {base_url}/models with a Bearer key, so they
+share this code and differ only in base URL and key.
 """
 
 import time
@@ -65,6 +65,29 @@ class _CompletionChunk(BaseModel):
     x_groq: _GroqExtra | None = None  # Groq reports usage here on the last chunk
 
 
+class _ModelEntry(BaseModel):
+    id: str
+    output_modalities: list[str] | None = None  # Groq says this; others leave it out
+
+
+class _ModelList(BaseModel):
+    data: list[_ModelEntry]
+
+
+def _chat_model_ids(models: _ModelList) -> list[str]:
+    """Model ids that can chat, sorted.
+
+    Speech and transcription models are dropped when the provider says what a model
+    outputs. Gemini's "models/" prefix is removed: its chat endpoint takes the bare name.
+    """
+    ids = {
+        model.id.removeprefix("models/")
+        for model in models.data
+        if model.output_modalities is None or "text" in model.output_modalities
+    }
+    return sorted(ids)
+
+
 def _error_reason(response: httpx.Response) -> str | None:
     """The provider's error message, from {"error": {"message": ...}}.
 
@@ -104,6 +127,7 @@ class OpenAICompatibleProvider:
     ) -> None:
         self._name = name
         self._url = base_url.rstrip("/") + "/chat/completions"
+        self._models_url = base_url.rstrip("/") + "/models"
         self._api_key = api_key
         self._client = client
         self._timeout = timeout_seconds
@@ -166,6 +190,23 @@ class OpenAICompatibleProvider:
             usage=completion.usage,
             latency_ms=latency_ms,
         )
+
+    async def list_models(self) -> list[str]:
+        try:
+            response = await self._client.get(
+                self._models_url, headers=self._headers(), timeout=self._timeout
+            )
+        except httpx.TransportError as exc:
+            raise self._network_error(exc) from None
+        if response.status_code != 200:
+            raise self._http_error(response)
+        try:
+            models = _ModelList.model_validate_json(response.content)
+        except ValidationError:
+            raise ProviderError(
+                self._name, "model list is not in the OpenAI format", status_code=200
+            ) from None
+        return _chat_model_ids(models)
 
     async def stream(self, request: ChatRequest) -> AsyncGenerator[ChatChunk]:
         """Yield the reply piece by piece, parsed from the provider's server-sent events."""

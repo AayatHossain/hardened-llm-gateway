@@ -275,3 +275,39 @@ async def test_stream_timeout_is_retryable() -> None:
 
     with pytest.raises(ProviderTimeoutError):
         await collect(make_provider(handler))
+
+
+async def test_list_models_keeps_chat_models_with_clean_ids() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "object": "list",
+                "data": [
+                    {"id": "openai/gpt-oss-20b", "output_modalities": ["text"]},
+                    {"id": "whisper-large-v3", "output_modalities": ["transcription"]},
+                    {"id": "models/gemini-2.5-flash", "owned_by": "google"},
+                    {"id": "gemini-2.5-flash"},
+                ],
+            },
+        )
+
+    ids = await make_provider(handler).list_models()
+    assert ids == ["gemini-2.5-flash", "openai/gpt-oss-20b"]
+    assert seen[0].method == "GET"
+    assert str(seen[0].url) == f"{BASE_URL}/models"
+    assert seen[0].headers["authorization"] == f"Bearer {API_KEY}"
+
+
+async def test_list_models_errors() -> None:
+    provider = make_provider(lambda _: httpx.Response(401, json=GROQ_404))
+    with pytest.raises(ProviderError) as info:
+        await provider.list_models()
+    assert info.value.status_code == 401
+
+    provider = make_provider(lambda _: httpx.Response(200, json={"models": []}))
+    with pytest.raises(ProviderError, match="model list"):
+        await provider.list_models()
