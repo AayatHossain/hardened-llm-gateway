@@ -129,6 +129,43 @@ def test_health_needs_no_key() -> None:
         assert client.get("/health").status_code == 200
 
 
+# --- model list --------------------------------------------------------------
+
+
+def get_models(*providers: FakeProvider, key: str | None = KEY) -> Any:
+    app = create_app(settings=Settings(**BASE_SETTINGS), providers={p.name: p for p in providers})
+    headers = {"authorization": f"Bearer {key}"} if key is not None else {}
+    with TestClient(app) as client:
+        return client.get("/v1/models", headers=headers)
+
+
+def test_models_lists_every_enabled_provider() -> None:
+    response = get_models(FakeProvider(), FakeProvider(name="backup"))
+    assert response.status_code == 200
+    body = response.json()
+    assert body["object"] == "list"
+    assert [m["id"] for m in body["data"]] == ["backup/m1", "backup/m2", "fake/m1", "fake/m2"]
+    assert body["data"][0] == {
+        "id": "backup/m1",
+        "object": "model",
+        "created": 0,
+        "owned_by": "backup",
+    }
+    assert response.headers["x-ratelimit-remaining-requests"] == "59"
+
+
+def test_models_skips_a_failing_provider() -> None:
+    response = get_models(FakeProvider(UNAVAILABLE), FakeProvider(name="backup"))
+    assert response.status_code == 200
+    assert [m["id"] for m in response.json()["data"]] == ["backup/m1", "backup/m2"]
+
+
+def test_models_needs_a_key() -> None:
+    provider = FakeProvider()
+    assert get_models(provider, key=None).status_code == 401
+    assert provider.model_list_calls == 0
+
+
 # --- per-client rate limits --------------------------------------------------
 
 

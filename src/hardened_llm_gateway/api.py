@@ -1,4 +1,4 @@
-"""The OpenAI-compatible chat endpoint.
+"""The OpenAI-compatible endpoints: POST /v1/chat/completions and GET /v1/models.
 
 Clients send model="<provider>/<model>", e.g. "groq/openai/gpt-oss-20b".
 Replies and errors use the OpenAI format, so OpenAI client libraries work unchanged,
@@ -26,6 +26,7 @@ from pydantic import BaseModel
 from hardened_llm_gateway.config import Settings
 from hardened_llm_gateway.fallback import Attempt, RetryPolicy, Target, run_with_fallback
 from hardened_llm_gateway.keys import Client, find_client
+from hardened_llm_gateway.models import ModelDirectory
 from hardened_llm_gateway.providers import (
     ChatChunk,
     ChatRequest,
@@ -64,6 +65,18 @@ class ChatCompletion(BaseModel):
     model: str
     choices: list[Choice]
     usage: Usage
+
+
+class ModelCard(BaseModel):
+    id: str
+    object: Literal["model"] = "model"
+    created: int = 0  # not every provider reports it
+    owned_by: str
+
+
+class ModelList(BaseModel):
+    object: Literal["list"] = "list"
+    data: list[ModelCard]
 
 
 class GatewayError(Exception):
@@ -158,7 +171,27 @@ def enforce_rate_limit(
     return result
 
 
-router = APIRouter(dependencies=[Depends(authenticate)])
+def get_model_directory(request: Request) -> ModelDirectory:
+    directory: ModelDirectory = request.app.state.model_directory
+    return directory
+
+
+# Every /v1 route needs a client key and counts against the client's limit. Routes that
+# also take `limits` get the same result: FastAPI runs a dependency once per request.
+router = APIRouter(dependencies=[Depends(enforce_rate_limit)])
+
+
+@router.get("/v1/models", response_model=ModelList)
+async def list_models(
+    response: Response,
+    providers: Annotated[Mapping[str, Provider], Depends(get_providers)],
+    directory: Annotated[ModelDirectory, Depends(get_model_directory)],
+    limits: Annotated[RateLimitResult, Depends(enforce_rate_limit)],
+) -> ModelList:
+    """The chat models of every enabled provider, named as /v1/chat/completions expects."""
+    response.headers.update(limits.headers())
+    ids = await directory.model_ids(providers)
+    return ModelList(data=[ModelCard(id=i, owned_by=i.partition("/")[0]) for i in ids])
 
 
 def _to_gateway_error(exc: ProviderError) -> GatewayError:
