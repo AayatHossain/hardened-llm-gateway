@@ -295,6 +295,20 @@ def test_provider_errors_map_to_http_status(error: ProviderError, expected_statu
     assert response.status_code == expected_status
 
 
+def test_rejected_request_shows_only_the_provider_reason() -> None:
+    error = ProviderError(
+        "fake",
+        'HTTP 404: {"error": {"message": "The model `m1` does not exist"}}',
+        status_code=404,
+        reason="The model `m1` does not exist",
+    )
+    response = post(FakeProvider(error), {"model": "fake/m1", "messages": MESSAGES})
+    assert response.status_code == 400
+    assert response.json()["error"]["message"] == (
+        "provider 'fake' rejected the request: The model `m1` does not exist"
+    )
+
+
 def test_provider_auth_failure_details_are_not_shown_to_client() -> None:
     error = ProviderError("fake", "HTTP 401: Invalid API Key", status_code=401)
     response = post(FakeProvider(error), {"model": "fake/m1", "messages": MESSAGES})

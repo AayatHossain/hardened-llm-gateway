@@ -115,6 +115,32 @@ async def test_bad_request_is_not_retryable() -> None:
     assert "unknown model" in str(info.value)
 
 
+GROQ_404 = {"error": {"message": "The model `x` does not exist", "type": "invalid_request_error"}}
+GEMINI_404 = [{"error": {"code": 404, "message": "models/x is not found", "status": "NOT_FOUND"}}]
+
+
+@pytest.mark.parametrize(
+    ("body", "reason"),
+    [
+        (GROQ_404, "The model `x` does not exist"),
+        (GEMINI_404, "models/x is not found"),
+        ({"error": "plain string"}, None),
+        ("not json", None),
+    ],
+    ids=["groq", "gemini", "other-json", "text"],
+)
+async def test_error_reason_is_taken_from_the_provider_body(body: Any, reason: str | None) -> None:
+    def handler(_: httpx.Request) -> httpx.Response:
+        if isinstance(body, str):
+            return httpx.Response(404, text=body)
+        return httpx.Response(404, json=body)
+
+    with pytest.raises(ProviderError) as info:
+        await make_provider(handler).chat(make_request())
+    assert info.value.reason == reason
+    assert str(info.value).startswith("fake: HTTP 404: ")
+
+
 async def test_timeout_is_retryable() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ReadTimeout("too slow", request=request)

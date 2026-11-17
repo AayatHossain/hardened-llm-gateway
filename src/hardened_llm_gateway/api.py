@@ -174,8 +174,11 @@ def _to_gateway_error(exc: ProviderError) -> GatewayError:
             429, f"provider {name!r} rate limit reached", "rate_limit_error", headers
         )
     if exc.status_code in (400, 404, 422):
-        # The request itself was wrong (e.g. an unknown model): pass the reason on.
-        return GatewayError(400, str(exc), "invalid_request_error")
+        # The request itself was wrong (e.g. an unknown model): pass the provider's reason on.
+        reason = exc.reason or f"HTTP {exc.status_code}"
+        return GatewayError(
+            400, f"provider {name!r} rejected the request: {reason}", "invalid_request_error"
+        )
     return GatewayError(502, f"provider {name!r} failed", "provider_error")
 
 

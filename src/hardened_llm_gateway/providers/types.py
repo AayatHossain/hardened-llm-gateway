@@ -61,6 +61,7 @@ class ProviderError(Exception):
 
     `retryable` is True when trying again (or trying another provider) may work:
     timeouts, network errors, rate limits (429) and server errors (5xx).
+    `reason` is the provider's own short explanation, e.g. "The model `x` does not exist".
     """
 
     def __init__(
@@ -71,12 +72,14 @@ class ProviderError(Exception):
         status_code: int | None = None,
         retryable: bool = False,
         retry_after_seconds: float | None = None,
+        reason: str | None = None,
     ) -> None:
         super().__init__(f"{provider}: {message}")
         self.provider = provider
         self.status_code = status_code
         self.retryable = retryable
         self.retry_after_seconds = retry_after_seconds
+        self.reason = reason
 
 
 class ProviderTimeoutError(ProviderError):

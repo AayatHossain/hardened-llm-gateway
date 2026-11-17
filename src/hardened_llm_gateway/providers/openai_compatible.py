@@ -65,6 +65,24 @@ class _CompletionChunk(BaseModel):
     x_groq: _GroqExtra | None = None  # Groq reports usage here on the last chunk
 
 
+def _error_reason(response: httpx.Response) -> str | None:
+    """The provider's error message, from {"error": {"message": ...}}.
+
+    Gemini wraps the same object in a 1-item list. Returns None for any other body.
+    """
+    try:
+        body: Any = response.json()
+    except ValueError:
+        return None
+    if isinstance(body, list) and body:
+        body = body[0]
+    error = body.get("error") if isinstance(body, dict) else None
+    message = error.get("message") if isinstance(error, dict) else None
+    if not isinstance(message, str) or not message.strip():
+        return None
+    return message.strip()[:_ERROR_BODY_LIMIT]
+
+
 def _retry_after(response: httpx.Response) -> float | None:
     value = response.headers.get("retry-after")
     if value is None:
@@ -102,12 +120,14 @@ class OpenAICompatibleProvider:
 
     def _http_error(self, response: httpx.Response) -> ProviderError:
         status = response.status_code
+        reason = _error_reason(response)
         return ProviderError(
             self._name,
-            f"HTTP {status}: {response.text[:_ERROR_BODY_LIMIT]}",
+            f"HTTP {status}: {reason or response.text[:_ERROR_BODY_LIMIT]}",
             status_code=status,
             retryable=status == 429 or status >= 500,
             retry_after_seconds=_retry_after(response),
+            reason=reason,
         )
 
     def _network_error(self, exc: httpx.TransportError) -> ProviderError:
