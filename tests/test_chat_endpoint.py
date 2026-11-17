@@ -8,6 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from hardened_llm_gateway.app import create_app
+from hardened_llm_gateway.config import Settings
 from hardened_llm_gateway.providers import (
     ChatChunk,
     ChatRequest,
@@ -26,9 +27,15 @@ class FakeProvider:
     When streaming, the error is raised after `fail_after_chunks` chunks.
     """
 
-    def __init__(self, error: ProviderError | None = None, fail_after_chunks: int = 0) -> None:
+    def __init__(
+        self,
+        error: ProviderError | None = None,
+        fail_after_chunks: int = 0,
+        name: str = "fake",
+    ) -> None:
         self.error = error
         self.fail_after_chunks = fail_after_chunks
+        self._name = name
         self.requests: list[ChatRequest] = []
 
     async def stream(self, request: ChatRequest) -> AsyncGenerator[ChatChunk]:
@@ -36,10 +43,10 @@ class FakeProvider:
         for index, piece in enumerate(["Hel", "lo!"]):
             if self.error is not None and index == self.fail_after_chunks:
                 raise self.error
-            yield ChatChunk(id="abc", provider="fake", model=request.model, delta=piece)
+            yield ChatChunk(id="abc", provider=self._name, model=request.model, delta=piece)
         yield ChatChunk(
             id="abc",
-            provider="fake",
+            provider=self._name,
             model=request.model,
             finish_reason="stop",
             usage=Usage(prompt_tokens=3, completion_tokens=2, total_tokens=5),
@@ -47,7 +54,7 @@ class FakeProvider:
 
     @property
     def name(self) -> str:
-        return "fake"
+        return self._name
 
     async def chat(self, request: ChatRequest) -> ChatResponse:
         self.requests.append(request)
@@ -55,7 +62,7 @@ class FakeProvider:
             raise self.error
         return ChatResponse(
             id="abc",
-            provider="fake",
+            provider=self._name,
             model=request.model,
             content="Hello!",
             finish_reason="stop",
@@ -64,8 +71,19 @@ class FakeProvider:
         )
 
 
-def post(provider: FakeProvider, body: dict[str, Any]) -> Any:
-    with TestClient(create_app(providers={"fake": provider})) as client:
+# No real waiting in tests: zero backoff, and any Retry-After is "too long" (use a fallback).
+NO_WAIT = {"retry_backoff_seconds": 0, "max_retry_wait_seconds": 0}
+
+
+def post(
+    provider: FakeProvider,
+    body: dict[str, Any],
+    *others: FakeProvider,
+    **settings: Any,
+) -> Any:
+    providers = {p.name: p for p in (provider, *others)}
+    app = create_app(settings=Settings(**{**NO_WAIT, **settings}), providers=providers)
+    with TestClient(app) as client:
         return client.post("/v1/chat/completions", json=body)
 
 
@@ -199,3 +217,62 @@ def test_provider_auth_failure_details_are_not_shown_to_client() -> None:
     response = post(FakeProvider(error), {"model": "fake/m1", "messages": MESSAGES})
     assert response.status_code == 502
     assert "Invalid API Key" not in response.text
+
+
+# --- retries and fallback ----------------------------------------------------
+
+UNAVAILABLE = ProviderError("fake", "HTTP 503", status_code=503, retryable=True)
+FALLBACK = {"fallbacks": {"fake/m1": ["backup/m2"]}}
+
+
+def test_decision_headers_on_first_try() -> None:
+    response = post(FakeProvider(), {"model": "fake/m1", "messages": MESSAGES})
+    assert response.headers["x-gateway-target"] == "fake/m1"
+    assert response.headers["x-gateway-attempts"] == "1"
+
+
+def test_retryable_failure_is_retried_on_the_same_target() -> None:
+    primary = FakeProvider(UNAVAILABLE)
+    response = post(primary, {"model": "fake/m1", "messages": MESSAGES})
+    assert response.status_code == 502  # still failing after the retry
+    assert len(primary.requests) == 2  # 1 try + 1 retry (max_retries defaults to 1)
+
+
+def test_falls_back_to_the_configured_backup() -> None:
+    primary = FakeProvider(UNAVAILABLE)
+    backup = FakeProvider(name="backup")
+    response = post(primary, {"model": "fake/m1", "messages": MESSAGES}, backup, **FALLBACK)
+
+    assert response.status_code == 200
+    assert response.json()["model"] == "backup/m2"
+    assert response.headers["x-gateway-provider"] == "backup"
+    assert response.headers["x-gateway-target"] == "backup/m2"
+    assert response.headers["x-gateway-attempts"] == "3"
+    assert backup.requests[0].model == "m2"
+
+
+def test_invalid_request_does_not_fall_back() -> None:
+    error = ProviderError("fake", "HTTP 400: bad temperature", status_code=400)
+    backup = FakeProvider(name="backup")
+    response = post(
+        FakeProvider(error), {"model": "fake/m1", "messages": MESSAGES}, backup, **FALLBACK
+    )
+    assert response.status_code == 400
+    assert backup.requests == []
+
+
+def test_stream_falls_back_before_the_first_chunk() -> None:
+    primary = FakeProvider(UNAVAILABLE, fail_after_chunks=0)
+    backup = FakeProvider(name="backup")
+    response = post(
+        primary,
+        {"model": "fake/m1", "messages": MESSAGES, "stream": True},
+        backup,
+        **FALLBACK,
+    )
+    assert response.status_code == 200
+    assert response.headers["x-gateway-target"] == "backup/m2"
+    events = stream_events(response)
+    assert events[-1] == "[DONE]"
+    assert all(e["model"] == "backup/m2" for e in events[:-1])
+    assert "".join(e["choices"][0]["delta"]["content"] for e in events[:-1]) == "Hello!"
