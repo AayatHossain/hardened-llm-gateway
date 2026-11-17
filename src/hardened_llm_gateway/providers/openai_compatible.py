@@ -1,8 +1,8 @@
 """One adapter for every provider that speaks the OpenAI chat format.
 
 Groq, Gemini (OpenAI-compatible endpoint), NVIDIA NIM and OpenRouter all accept
-POST {base_url}/chat/completions with a Bearer key, so they share this code and
-differ only in base URL and key.
+POST {base_url}/chat/completions and GET {base_url}/models with a Bearer key, so they
+share this code and differ only in base URL and key.
 """
 
 import time
@@ -65,6 +65,47 @@ class _CompletionChunk(BaseModel):
     x_groq: _GroqExtra | None = None  # Groq reports usage here on the last chunk
 
 
+class _ModelEntry(BaseModel):
+    id: str
+    output_modalities: list[str] | None = None  # Groq says this; others leave it out
+
+
+class _ModelList(BaseModel):
+    data: list[_ModelEntry]
+
+
+def _chat_model_ids(models: _ModelList) -> list[str]:
+    """Model ids that can chat, sorted.
+
+    Speech and transcription models are dropped when the provider says what a model
+    outputs. Gemini's "models/" prefix is removed: its chat endpoint takes the bare name.
+    """
+    ids = {
+        model.id.removeprefix("models/")
+        for model in models.data
+        if model.output_modalities is None or "text" in model.output_modalities
+    }
+    return sorted(ids)
+
+
+def _error_reason(response: httpx.Response) -> str | None:
+    """The provider's error message, from {"error": {"message": ...}}.
+
+    Gemini wraps the same object in a 1-item list. Returns None for any other body.
+    """
+    try:
+        body: Any = response.json()
+    except ValueError:
+        return None
+    if isinstance(body, list) and body:
+        body = body[0]
+    error = body.get("error") if isinstance(body, dict) else None
+    message = error.get("message") if isinstance(error, dict) else None
+    if not isinstance(message, str) or not message.strip():
+        return None
+    return message.strip()[:_ERROR_BODY_LIMIT]
+
+
 def _retry_after(response: httpx.Response) -> float | None:
     value = response.headers.get("retry-after")
     if value is None:
@@ -86,6 +127,7 @@ class OpenAICompatibleProvider:
     ) -> None:
         self._name = name
         self._url = base_url.rstrip("/") + "/chat/completions"
+        self._models_url = base_url.rstrip("/") + "/models"
         self._api_key = api_key
         self._client = client
         self._timeout = timeout_seconds
@@ -102,12 +144,14 @@ class OpenAICompatibleProvider:
 
     def _http_error(self, response: httpx.Response) -> ProviderError:
         status = response.status_code
+        reason = _error_reason(response)
         return ProviderError(
             self._name,
-            f"HTTP {status}: {response.text[:_ERROR_BODY_LIMIT]}",
+            f"HTTP {status}: {reason or response.text[:_ERROR_BODY_LIMIT]}",
             status_code=status,
             retryable=status == 429 or status >= 500,
             retry_after_seconds=_retry_after(response),
+            reason=reason,
         )
 
     def _network_error(self, exc: httpx.TransportError) -> ProviderError:
@@ -146,6 +190,23 @@ class OpenAICompatibleProvider:
             usage=completion.usage,
             latency_ms=latency_ms,
         )
+
+    async def list_models(self) -> list[str]:
+        try:
+            response = await self._client.get(
+                self._models_url, headers=self._headers(), timeout=self._timeout
+            )
+        except httpx.TransportError as exc:
+            raise self._network_error(exc) from None
+        if response.status_code != 200:
+            raise self._http_error(response)
+        try:
+            models = _ModelList.model_validate_json(response.content)
+        except ValidationError:
+            raise ProviderError(
+                self._name, "model list is not in the OpenAI format", status_code=200
+            ) from None
+        return _chat_model_ids(models)
 
     async def stream(self, request: ChatRequest) -> AsyncGenerator[ChatChunk]:
         """Yield the reply piece by piece, parsed from the provider's server-sent events."""

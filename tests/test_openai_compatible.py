@@ -115,6 +115,32 @@ async def test_bad_request_is_not_retryable() -> None:
     assert "unknown model" in str(info.value)
 
 
+GROQ_404 = {"error": {"message": "The model `x` does not exist", "type": "invalid_request_error"}}
+GEMINI_404 = [{"error": {"code": 404, "message": "models/x is not found", "status": "NOT_FOUND"}}]
+
+
+@pytest.mark.parametrize(
+    ("body", "reason"),
+    [
+        (GROQ_404, "The model `x` does not exist"),
+        (GEMINI_404, "models/x is not found"),
+        ({"error": "plain string"}, None),
+        ("not json", None),
+    ],
+    ids=["groq", "gemini", "other-json", "text"],
+)
+async def test_error_reason_is_taken_from_the_provider_body(body: Any, reason: str | None) -> None:
+    def handler(_: httpx.Request) -> httpx.Response:
+        if isinstance(body, str):
+            return httpx.Response(404, text=body)
+        return httpx.Response(404, json=body)
+
+    with pytest.raises(ProviderError) as info:
+        await make_provider(handler).chat(make_request())
+    assert info.value.reason == reason
+    assert str(info.value).startswith("fake: HTTP 404: ")
+
+
 async def test_timeout_is_retryable() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ReadTimeout("too slow", request=request)
@@ -249,3 +275,39 @@ async def test_stream_timeout_is_retryable() -> None:
 
     with pytest.raises(ProviderTimeoutError):
         await collect(make_provider(handler))
+
+
+async def test_list_models_keeps_chat_models_with_clean_ids() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "object": "list",
+                "data": [
+                    {"id": "openai/gpt-oss-20b", "output_modalities": ["text"]},
+                    {"id": "whisper-large-v3", "output_modalities": ["transcription"]},
+                    {"id": "models/gemini-2.5-flash", "owned_by": "google"},
+                    {"id": "gemini-2.5-flash"},
+                ],
+            },
+        )
+
+    ids = await make_provider(handler).list_models()
+    assert ids == ["gemini-2.5-flash", "openai/gpt-oss-20b"]
+    assert seen[0].method == "GET"
+    assert str(seen[0].url) == f"{BASE_URL}/models"
+    assert seen[0].headers["authorization"] == f"Bearer {API_KEY}"
+
+
+async def test_list_models_errors() -> None:
+    provider = make_provider(lambda _: httpx.Response(401, json=GROQ_404))
+    with pytest.raises(ProviderError) as info:
+        await provider.list_models()
+    assert info.value.status_code == 401
+
+    provider = make_provider(lambda _: httpx.Response(200, json={"models": []}))
+    with pytest.raises(ProviderError, match="model list"):
+        await provider.list_models()

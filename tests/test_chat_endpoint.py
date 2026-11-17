@@ -1,9 +1,15 @@
-"""Tests for POST /v1/chat/completions, with a fake provider (no network, no keys)."""
+"""Tests for the /v1 endpoints, with a fake provider (no network, no keys).
+
+The last section drives the gateway with the official OpenAI Python SDK.
+"""
 
 import json
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
+import httpx2
+import openai
 import pytest
 from fastapi.testclient import TestClient
 
@@ -38,6 +44,7 @@ class FakeProvider:
         self.fail_after_chunks = fail_after_chunks
         self._name = name
         self.requests: list[ChatRequest] = []
+        self.model_list_calls = 0
 
     async def stream(self, request: ChatRequest) -> AsyncGenerator[ChatChunk]:
         self.requests.append(request)
@@ -56,6 +63,12 @@ class FakeProvider:
     @property
     def name(self) -> str:
         return self._name
+
+    async def list_models(self) -> list[str]:
+        self.model_list_calls += 1
+        if self.error is not None:
+            raise self.error
+        return ["m1", "m2"]
 
     async def chat(self, request: ChatRequest) -> ChatResponse:
         self.requests.append(request)
@@ -120,6 +133,43 @@ def test_no_configured_clients_rejects_every_key() -> None:
 def test_health_needs_no_key() -> None:
     with TestClient(create_app(settings=Settings())) as client:
         assert client.get("/health").status_code == 200
+
+
+# --- model list --------------------------------------------------------------
+
+
+def get_models(*providers: FakeProvider, key: str | None = KEY) -> Any:
+    app = create_app(settings=Settings(**BASE_SETTINGS), providers={p.name: p for p in providers})
+    headers = {"authorization": f"Bearer {key}"} if key is not None else {}
+    with TestClient(app) as client:
+        return client.get("/v1/models", headers=headers)
+
+
+def test_models_lists_every_enabled_provider() -> None:
+    response = get_models(FakeProvider(), FakeProvider(name="backup"))
+    assert response.status_code == 200
+    body = response.json()
+    assert body["object"] == "list"
+    assert [m["id"] for m in body["data"]] == ["backup/m1", "backup/m2", "fake/m1", "fake/m2"]
+    assert body["data"][0] == {
+        "id": "backup/m1",
+        "object": "model",
+        "created": 0,
+        "owned_by": "backup",
+    }
+    assert response.headers["x-ratelimit-remaining-requests"] == "59"
+
+
+def test_models_skips_a_failing_provider() -> None:
+    response = get_models(FakeProvider(UNAVAILABLE), FakeProvider(name="backup"))
+    assert response.status_code == 200
+    assert [m["id"] for m in response.json()["data"]] == ["backup/m1", "backup/m2"]
+
+
+def test_models_needs_a_key() -> None:
+    provider = FakeProvider()
+    assert get_models(provider, key=None).status_code == 401
+    assert provider.model_list_calls == 0
 
 
 # --- per-client rate limits --------------------------------------------------
@@ -295,6 +345,20 @@ def test_provider_errors_map_to_http_status(error: ProviderError, expected_statu
     assert response.status_code == expected_status
 
 
+def test_rejected_request_shows_only_the_provider_reason() -> None:
+    error = ProviderError(
+        "fake",
+        'HTTP 404: {"error": {"message": "The model `m1` does not exist"}}',
+        status_code=404,
+        reason="The model `m1` does not exist",
+    )
+    response = post(FakeProvider(error), {"model": "fake/m1", "messages": MESSAGES})
+    assert response.status_code == 400
+    assert response.json()["error"]["message"] == (
+        "provider 'fake' rejected the request: The model `m1` does not exist"
+    )
+
+
 def test_provider_auth_failure_details_are_not_shown_to_client() -> None:
     error = ProviderError("fake", "HTTP 401: Invalid API Key", status_code=401)
     response = post(FakeProvider(error), {"model": "fake/m1", "messages": MESSAGES})
@@ -359,3 +423,86 @@ def test_stream_falls_back_before_the_first_chunk() -> None:
     assert events[-1] == "[DONE]"
     assert all(e["model"] == "backup/m2" for e in events[:-1])
     assert "".join(e["choices"][0]["delta"]["content"] for e in events[:-1]) == "Hello!"
+
+
+# --- the official OpenAI SDK, pointed at the gateway --------------------------
+
+
+@asynccontextmanager
+async def sdk(
+    *providers: FakeProvider, key: str = KEY, **settings: Any
+) -> AsyncIterator[openai.AsyncOpenAI]:
+    """An OpenAI SDK client whose only changes are base_url and api_key.
+
+    It reaches the app in memory through an ASGI transport, so no server or network
+    is needed. SDK retries are off so each test sees exactly one gateway reply.
+    """
+    app = create_app(
+        settings=Settings(**{**BASE_SETTINGS, **settings}),
+        providers={p.name: p for p in providers},
+    )
+    async with (
+        app.router.lifespan_context(app),
+        httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app)) as http,
+    ):
+        yield openai.AsyncOpenAI(
+            api_key=key, base_url="http://gateway/v1", http_client=http, max_retries=0
+        )
+
+
+@pytest.mark.anyio
+async def test_sdk_chat() -> None:
+    async with sdk(FakeProvider()) as client:
+        reply = await client.chat.completions.create(
+            model="fake/m1", messages=[{"role": "user", "content": "hi"}]
+        )
+    assert reply.choices[0].message.content == "Hello!"
+    assert reply.model == "fake/m1"
+    assert reply.usage is not None
+    assert reply.usage.total_tokens == 5
+
+
+@pytest.mark.anyio
+async def test_sdk_streaming() -> None:
+    async with sdk(FakeProvider()) as client:
+        stream = await client.chat.completions.create(
+            model="fake/m1", messages=[{"role": "user", "content": "hi"}], stream=True
+        )
+        pieces = [c.choices[0].delta.content or "" async for c in stream if c.choices]
+    assert "".join(pieces) == "Hello!"
+
+
+@pytest.mark.anyio
+async def test_sdk_reads_gateway_headers() -> None:
+    async with sdk(FakeProvider()) as client:
+        raw = await client.chat.completions.with_raw_response.create(
+            model="fake/m1", messages=[{"role": "user", "content": "hi"}]
+        )
+    assert raw.headers["x-gateway-target"] == "fake/m1"
+    assert raw.headers["x-ratelimit-remaining-requests"] == "59"
+
+
+@pytest.mark.anyio
+async def test_sdk_lists_models() -> None:
+    async with sdk(FakeProvider()) as client:
+        ids = [model.id async for model in client.models.list()]
+    assert ids == ["fake/m1", "fake/m2"]
+
+
+@pytest.mark.anyio
+async def test_sdk_raises_its_usual_exceptions() -> None:
+    message: Any = [{"role": "user", "content": "hi"}]
+
+    async with sdk(FakeProvider(), key="gw-wrong") as client:
+        with pytest.raises(openai.AuthenticationError):
+            await client.chat.completions.create(model="fake/m1", messages=message)
+
+    async with sdk(FakeProvider()) as client:
+        with pytest.raises(openai.BadRequestError, match="provider"):
+            await client.chat.completions.create(model="no-prefix", messages=message)
+
+    limited = {"tests": {"key_sha256": hash_key(KEY), "requests_per_minute": 1}}
+    async with sdk(FakeProvider(), clients=limited) as client:
+        await client.chat.completions.create(model="fake/m1", messages=message)
+        with pytest.raises(openai.RateLimitError):
+            await client.chat.completions.create(model="fake/m1", messages=message)

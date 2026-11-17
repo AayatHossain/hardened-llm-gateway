@@ -49,6 +49,9 @@ class ScriptedProvider:
         raise NotImplementedError
         yield  # makes this an async generator
 
+    async def list_models(self) -> list[str]:
+        raise NotImplementedError
+
 
 def server_error(name: str = "a") -> ProviderError:
     return ProviderError(name, "HTTP 503", status_code=503, retryable=True)
