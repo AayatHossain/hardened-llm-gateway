@@ -21,6 +21,12 @@ dist/
 htmlcov/
 .ipynb_checkpoints/
 
+# --- Local data (the request log) ---
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
 # --- Node / Next.js (dashboard) ---
 node_modules/
 .next/

@@ -61,6 +61,10 @@ class Settings(BaseSettings):
     # With no clients, every /v1 request is rejected.
     clients: dict[str, ClientConfig] = Field(default_factory=dict)
 
+    # Where the request log is written (SQLAlchemy URL). Empty turns the log off.
+    # Postgres later: postgresql+asyncpg://user:password@host/db
+    request_log_url: str = "sqlite+aiosqlite:///gateway.db"
+
     @field_validator("fallbacks")
     @classmethod
     def _targets_have_provider_prefix(cls, value: dict[str, list[str]]) -> dict[str, list[str]]:
