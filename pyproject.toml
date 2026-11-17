@@ -16,6 +16,7 @@ dependencies = [
 dev = [
     "httpx2>=2.16.0",
     "mypy>=2.4",
+    "openai>=3.42.1",
     "pytest>=9.2",
     "ruff>=0.17",
 ]
