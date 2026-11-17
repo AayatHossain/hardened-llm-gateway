@@ -1,0 +1,98 @@
+# List prices on each provider's PAID tier, in USD per 1 million tokens.
+#
+# The gateway runs on free tiers, so these numbers say what the traffic would cost on a
+# paid plan. They make models and routing strategies comparable on cost.
+#
+# Keys are "<provider>/<model>", exactly as clients send them. A model missing here has
+# no known price and its cost is reported as unknown, never as 0.
+# A `changes` entry is a price that starts on its `from` date (UTC).
+#
+# Simplifications, all of which make the cost an upper bound or a close estimate:
+# - text prices only (the gateway only sends text);
+# - cached-input discounts are ignored;
+# - for models priced by prompt length, the price for prompts up to 200k tokens is used.
+#
+# Sources, checked 2026-11-17:
+# - groq:   the "pricing" field of GET https://api.groq.com/openai/v1/models
+#           (allam-2-7b has no price there, so it is left out)
+# - gemini: https://aistudio.google.com/docs/pricing (Standard paid tier)
+
+# --- Groq --------------------------------------------------------------------
+
+[models."groq/openai/gpt-oss-20b"]
+input = 0.075
+output = 0.30
+
+[models."groq/openai/gpt-oss-120b"]
+input = 0.15
+output = 0.60
+
+[models."groq/openai/gpt-oss-safeguard-20b"]
+input = 0.075
+output = 0.30
+
+[models."groq/qwen/qwen3.8-27b"]
+input = 0.80
+output = 4.00
+
+[models."groq/meta-llama/llama-prompt-guard-2-22m"]
+input = 0.03
+output = 0.03
+
+[models."groq/meta-llama/llama-prompt-guard-2-86m"]
+input = 0.04
+output = 0.04
+
+# --- Gemini ------------------------------------------------------------------
+
+[models."gemini/gemini-4-carbon"]
+input = 2.00
+output = 10.00
+changes = [{ from = 2026-12-01, input = 4.00, output = 20.00 }]
+
+[models."gemini/gemini-4-argon"]
+input = 2.00
+output = 10.00
+changes = [{ from = 2026-12-01, input = 4.00, output = 20.00 }]
+
+[models."gemini/gemini-4-hydrogen"]
+input = 1.50
+output = 7.50
+
+[models."gemini/gemini-3.8-flash"]
+input = 0.75
+output = 3.75
+changes = [{ from = 2027-01-01, input = 1.50, output = 7.50 }]
+
+[models."gemini/gemini-3.6-flash"]
+input = 0.75
+output = 3.75
+changes = [{ from = 2027-01-01, input = 1.50, output = 7.50 }]
+
+[models."gemini/gemini-3.5-flash-lite"]
+input = 0.30
+output = 2.50
+
+[models."gemini/gemini-3.1-pro-preview"]  # above 200k prompt tokens: 4.00 / 18.00
+input = 2.00
+output = 12.00
+
+[models."gemini/gemini-3.1-flash-lite"]
+input = 0.25
+output = 1.50
+
+[models."gemini/gemini-3-flash-preview"]
+input = 0.50
+output = 3.00
+
+[models."gemini/gemini-2.5-pro"]  # above 200k prompt tokens: 2.50 / 15.00
+input = 1.25
+output = 10.00
+
+[models."gemini/gemini-2.5-flash"]
+input = 0.30
+output = 2.50
+
+[models."gemini/gemini-2.5-flash-lite"]
+input = 0.10
+output = 0.40
