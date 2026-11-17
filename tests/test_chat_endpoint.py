@@ -73,7 +73,7 @@ class FakeProvider:
 
 
 KEY = "gw-test-key"
-BASE_SETTINGS = {
+BASE_SETTINGS: dict[str, Any] = {
     "clients": {"tests": {"key_sha256": hash_key(KEY)}},
     # No real waiting in tests: zero backoff, and any Retry-After is "too long" (use a fallback).
     "retry_backoff_seconds": 0,
@@ -120,6 +120,51 @@ def test_no_configured_clients_rejects_every_key() -> None:
 def test_health_needs_no_key() -> None:
     with TestClient(create_app(settings=Settings())) as client:
         assert client.get("/health").status_code == 200
+
+
+# --- per-client rate limits --------------------------------------------------
+
+
+def test_client_over_its_limit_gets_429_before_any_provider_call() -> None:
+    other_key = "gw-other-key"
+    clients = {
+        "tests": {"key_sha256": hash_key(KEY), "requests_per_minute": 2},
+        "other": {"key_sha256": hash_key(other_key), "requests_per_minute": 2},
+    }
+    provider = FakeProvider()
+    app = create_app(
+        settings=Settings(**{**BASE_SETTINGS, "clients": clients}),
+        providers={"fake": provider},
+    )
+    body = {"model": "fake/m1", "messages": MESSAGES}
+
+    def send(key: str) -> Any:
+        return client.post(
+            "/v1/chat/completions", json=body, headers={"authorization": f"Bearer {key}"}
+        )
+
+    with TestClient(app) as client:
+        first, second, third = send(KEY), send(KEY), send(KEY)
+        other = send(other_key)
+
+    assert [r.status_code for r in (first, second)] == [200, 200]
+    assert first.headers["x-ratelimit-limit-requests"] == "2"
+    assert first.headers["x-ratelimit-remaining-requests"] == "1"
+
+    assert third.status_code == 429
+    assert third.json()["error"]["code"] == "client_rate_limit_exceeded"
+    assert third.headers["x-ratelimit-remaining-requests"] == "0"
+    assert 1 <= int(third.headers["retry-after"]) <= 30  # 2 per minute: 1 back every 30 s
+    assert len(provider.requests) == 3  # 2 for "tests", 1 for "other"; the 429 never got through
+
+    assert other.status_code == 200  # each client has its own limit
+
+
+def test_streamed_reply_has_rate_limit_headers() -> None:
+    response = post(FakeProvider(), {"model": "fake/m1", "messages": MESSAGES, "stream": True})
+    assert response.status_code == 200
+    assert response.headers["x-ratelimit-limit-requests"] == "60"
+    assert response.headers["x-ratelimit-remaining-requests"] == "59"
 
 
 # --- chat --------------------------------------------------------------------
