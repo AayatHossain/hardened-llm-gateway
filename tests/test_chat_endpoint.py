@@ -1,9 +1,15 @@
-"""Tests for POST /v1/chat/completions, with a fake provider (no network, no keys)."""
+"""Tests for the /v1 endpoints, with a fake provider (no network, no keys).
+
+The last section drives the gateway with the official OpenAI Python SDK.
+"""
 
 import json
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
+import httpx2
+import openai
 import pytest
 from fastapi.testclient import TestClient
 
@@ -417,3 +423,86 @@ def test_stream_falls_back_before_the_first_chunk() -> None:
     assert events[-1] == "[DONE]"
     assert all(e["model"] == "backup/m2" for e in events[:-1])
     assert "".join(e["choices"][0]["delta"]["content"] for e in events[:-1]) == "Hello!"
+
+
+# --- the official OpenAI SDK, pointed at the gateway --------------------------
+
+
+@asynccontextmanager
+async def sdk(
+    *providers: FakeProvider, key: str = KEY, **settings: Any
+) -> AsyncIterator[openai.AsyncOpenAI]:
+    """An OpenAI SDK client whose only changes are base_url and api_key.
+
+    It reaches the app in memory through an ASGI transport, so no server or network
+    is needed. SDK retries are off so each test sees exactly one gateway reply.
+    """
+    app = create_app(
+        settings=Settings(**{**BASE_SETTINGS, **settings}),
+        providers={p.name: p for p in providers},
+    )
+    async with (
+        app.router.lifespan_context(app),
+        httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app)) as http,
+    ):
+        yield openai.AsyncOpenAI(
+            api_key=key, base_url="http://gateway/v1", http_client=http, max_retries=0
+        )
+
+
+@pytest.mark.anyio
+async def test_sdk_chat() -> None:
+    async with sdk(FakeProvider()) as client:
+        reply = await client.chat.completions.create(
+            model="fake/m1", messages=[{"role": "user", "content": "hi"}]
+        )
+    assert reply.choices[0].message.content == "Hello!"
+    assert reply.model == "fake/m1"
+    assert reply.usage is not None
+    assert reply.usage.total_tokens == 5
+
+
+@pytest.mark.anyio
+async def test_sdk_streaming() -> None:
+    async with sdk(FakeProvider()) as client:
+        stream = await client.chat.completions.create(
+            model="fake/m1", messages=[{"role": "user", "content": "hi"}], stream=True
+        )
+        pieces = [c.choices[0].delta.content or "" async for c in stream if c.choices]
+    assert "".join(pieces) == "Hello!"
+
+
+@pytest.mark.anyio
+async def test_sdk_reads_gateway_headers() -> None:
+    async with sdk(FakeProvider()) as client:
+        raw = await client.chat.completions.with_raw_response.create(
+            model="fake/m1", messages=[{"role": "user", "content": "hi"}]
+        )
+    assert raw.headers["x-gateway-target"] == "fake/m1"
+    assert raw.headers["x-ratelimit-remaining-requests"] == "59"
+
+
+@pytest.mark.anyio
+async def test_sdk_lists_models() -> None:
+    async with sdk(FakeProvider()) as client:
+        ids = [model.id async for model in client.models.list()]
+    assert ids == ["fake/m1", "fake/m2"]
+
+
+@pytest.mark.anyio
+async def test_sdk_raises_its_usual_exceptions() -> None:
+    message: Any = [{"role": "user", "content": "hi"}]
+
+    async with sdk(FakeProvider(), key="gw-wrong") as client:
+        with pytest.raises(openai.AuthenticationError):
+            await client.chat.completions.create(model="fake/m1", messages=message)
+
+    async with sdk(FakeProvider()) as client:
+        with pytest.raises(openai.BadRequestError, match="provider"):
+            await client.chat.completions.create(model="no-prefix", messages=message)
+
+    limited = {"tests": {"key_sha256": hash_key(KEY), "requests_per_minute": 1}}
+    async with sdk(FakeProvider(), clients=limited) as client:
+        await client.chat.completions.create(model="fake/m1", messages=message)
+        with pytest.raises(openai.RateLimitError):
+            await client.chat.completions.create(model="fake/m1", messages=message)
