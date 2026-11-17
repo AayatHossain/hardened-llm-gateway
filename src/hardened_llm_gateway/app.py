@@ -26,6 +26,8 @@ def create_app(
     sharing one HTTP client that is closed on shutdown.
     """
     resolved_settings = settings or get_settings()
+    if not resolved_settings.clients:
+        logger.warning("no clients configured (GATEWAY_CLIENTS): every /v1 request will get 401")
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:

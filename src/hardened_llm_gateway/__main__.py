@@ -4,7 +4,7 @@ import uvicorn
 
 
 def main() -> None:
-    # Bind to localhost only: the gateway holds provider keys and has no client auth yet.
+    # Bind to localhost only until the gateway is deployed behind HTTPS.
     uvicorn.run(
         "hardened_llm_gateway.app:create_app",
         factory=True,

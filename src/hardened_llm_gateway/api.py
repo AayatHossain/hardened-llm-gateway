@@ -4,6 +4,7 @@ Clients send model="<provider>/<model>", e.g. "groq/openai/gpt-oss-20b".
 Replies and errors use the OpenAI format, so OpenAI client libraries work unchanged,
 including streaming (stream=true returns server-sent events).
 
+Every /v1 request needs a client key ("Authorization: Bearer <key>", see keys.py).
 Each request is retried and, if configured, sent to fallback targets when the
 requested provider keeps failing (see fallback.py).
 """
@@ -18,10 +19,12 @@ from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 
 from hardened_llm_gateway.config import Settings
 from hardened_llm_gateway.fallback import Attempt, RetryPolicy, Target, run_with_fallback
+from hardened_llm_gateway.keys import Client, find_client
 from hardened_llm_gateway.providers import (
     ChatChunk,
     ChatRequest,
@@ -33,8 +36,6 @@ from hardened_llm_gateway.providers import (
 )
 
 logger = logging.getLogger(__name__)
-
-router = APIRouter()
 
 
 class ChatCompletionRequest(ChatRequest):
@@ -72,15 +73,20 @@ class GatewayError(Exception):
         message: str,
         error_type: str,
         headers: dict[str, str] | None = None,
+        code: str | None = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.message = message
         self.error_type = error_type
         self.headers = headers
+        self.code = code
 
     def body(self) -> dict[str, Any]:
-        return {"error": {"message": self.message, "type": self.error_type}}
+        error: dict[str, Any] = {"message": self.message, "type": self.error_type}
+        if self.code is not None:
+            error["code"] = self.code
+        return {"error": error}
 
 
 async def gateway_error_handler(_: Request, exc: Exception) -> JSONResponse:
@@ -96,6 +102,35 @@ def get_providers(request: Request) -> Mapping[str, Provider]:
 def get_gateway_settings(request: Request) -> Settings:
     settings: Settings = request.app.state.settings
     return settings
+
+
+# auto_error=False: a missing key gets our OpenAI-style error, not FastAPI's default 403.
+_bearer = HTTPBearer(auto_error=False, description="A client key made with the keys command")
+
+
+def authenticate(
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer)],
+    settings: Annotated[Settings, Depends(get_gateway_settings)],
+) -> Client:
+    """The client calling the gateway, identified by its "Authorization: Bearer" key."""
+    if credentials is None:
+        message = "missing API key: send the header 'Authorization: Bearer <key>'"
+        client = None
+    else:
+        message = "invalid API key"
+        client = find_client(credentials.credentials, settings.clients)
+    if client is None:
+        raise GatewayError(
+            401,
+            message,
+            "invalid_request_error",
+            headers={"www-authenticate": "Bearer"},
+            code="invalid_api_key",
+        )
+    return client
+
+
+router = APIRouter(dependencies=[Depends(authenticate)])
 
 
 def _to_gateway_error(exc: ProviderError) -> GatewayError:

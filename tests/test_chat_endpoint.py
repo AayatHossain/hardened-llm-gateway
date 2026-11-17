@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from hardened_llm_gateway.app import create_app
 from hardened_llm_gateway.config import Settings
+from hardened_llm_gateway.keys import hash_key
 from hardened_llm_gateway.providers import (
     ChatChunk,
     ChatRequest,
@@ -71,20 +72,57 @@ class FakeProvider:
         )
 
 
-# No real waiting in tests: zero backoff, and any Retry-After is "too long" (use a fallback).
-NO_WAIT = {"retry_backoff_seconds": 0, "max_retry_wait_seconds": 0}
+KEY = "gw-test-key"
+BASE_SETTINGS = {
+    "clients": {"tests": {"key_sha256": hash_key(KEY)}},
+    # No real waiting in tests: zero backoff, and any Retry-After is "too long" (use a fallback).
+    "retry_backoff_seconds": 0,
+    "max_retry_wait_seconds": 0,
+}
 
 
 def post(
     provider: FakeProvider,
     body: dict[str, Any],
     *others: FakeProvider,
+    key: str | None = KEY,
     **settings: Any,
 ) -> Any:
     providers = {p.name: p for p in (provider, *others)}
-    app = create_app(settings=Settings(**{**NO_WAIT, **settings}), providers=providers)
+    app = create_app(settings=Settings(**{**BASE_SETTINGS, **settings}), providers=providers)
+    headers = {"authorization": f"Bearer {key}"} if key is not None else {}
     with TestClient(app) as client:
-        return client.post("/v1/chat/completions", json=body)
+        return client.post("/v1/chat/completions", json=body, headers=headers)
+
+
+# --- client keys -------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("key", "message"), [(None, "missing API key"), ("gw-wrong", "invalid API key")]
+)
+def test_request_without_a_valid_key_is_rejected(key: str | None, message: str) -> None:
+    provider = FakeProvider()
+    response = post(provider, {"model": "fake/m1", "messages": MESSAGES}, key=key)
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"] == "Bearer"
+    error = response.json()["error"]
+    assert error["code"] == "invalid_api_key"
+    assert message in error["message"]
+    assert provider.requests == []  # rejected before any provider call
+
+
+def test_no_configured_clients_rejects_every_key() -> None:
+    response = post(FakeProvider(), {"model": "fake/m1", "messages": MESSAGES}, clients={})
+    assert response.status_code == 401
+
+
+def test_health_needs_no_key() -> None:
+    with TestClient(create_app(settings=Settings())) as client:
+        assert client.get("/health").status_code == 200
+
+
+# --- chat --------------------------------------------------------------------
 
 
 def test_successful_chat() -> None:
@@ -222,7 +260,7 @@ def test_provider_auth_failure_details_are_not_shown_to_client() -> None:
 # --- retries and fallback ----------------------------------------------------
 
 UNAVAILABLE = ProviderError("fake", "HTTP 503", status_code=503, retryable=True)
-FALLBACK = {"fallbacks": {"fake/m1": ["backup/m2"]}}
+FALLBACK: dict[str, Any] = {"fallbacks": {"fake/m1": ["backup/m2"]}}
 
 
 def test_decision_headers_on_first_try() -> None:
