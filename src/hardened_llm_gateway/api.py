@@ -10,6 +10,7 @@ Each request is retried and, if configured, sent to fallback targets when the
 requested provider keeps failing (see fallback.py).
 """
 
+import asyncio
 import dataclasses
 import datetime
 import json
@@ -17,12 +18,13 @@ import logging
 import math
 import time
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Mapping
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from opentelemetry.trace import Span, SpanKind, Status, StatusCode, Tracer, get_current_span
 from pydantic import BaseModel
 
 from hardened_llm_gateway.config import Settings
@@ -154,12 +156,30 @@ def get_rate_limiter(request: Request) -> RateLimiter:
     return limiter
 
 
-def enforce_rate_limit(
+def get_request_tracer(request: Request) -> Tracer:
+    tracer: Tracer = request.app.state.tracer
+    return tracer
+
+
+async def enforce_rate_limit(
     client: Annotated[Client, Depends(authenticate)],
     limiter: Annotated[RateLimiter, Depends(get_rate_limiter)],
+    tracer: Annotated[Tracer, Depends(get_request_tracer)],
 ) -> RateLimitResult:
-    """Count the request against the client's per-minute limit, or answer 429."""
-    result = limiter.check(client.name, client.requests_per_minute)
+    """Count the request against the client's per-minute limit, or answer 429.
+
+    Async on purpose: it then runs in the request's own task, inside its trace.
+    """
+    get_current_span().set_attribute("gateway.client", client.name)
+    with tracer.start_as_current_span("rate limit") as span:
+        result = limiter.check(client.name, client.requests_per_minute)
+        span.set_attributes(
+            {
+                "gateway.rate_limit.limit": result.limit,
+                "gateway.rate_limit.remaining": result.remaining,
+                "gateway.rate_limit.allowed": result.allowed,
+            }
+        )
     if not result.allowed:
         raise GatewayError(
             429,
@@ -267,14 +287,73 @@ def get_request_log(request: Request) -> RequestRecorder:
     return request_log
 
 
+def _traced_call[T](
+    tracer: Tracer, call: Callable[[Provider, Target], Awaitable[T]]
+) -> Callable[[Provider, Target], Awaitable[T]]:
+    """`call` with 1 span per attempt, named and described as OpenTelemetry GenAI asks."""
+    attempt = 0
+
+    async def traced(provider: Provider, target: Target) -> T:
+        nonlocal attempt
+        attempt += 1
+        attributes: dict[str, str | int] = {
+            "gen_ai.operation.name": "chat",
+            "gen_ai.provider.name": target.provider,
+            "gen_ai.request.model": target.model,
+            "gateway.target": str(target),
+            "gateway.attempt": attempt,
+        }
+        # Exceptions are described by hand: their text can quote the provider's reply.
+        with tracer.start_as_current_span(
+            f"chat {target}",
+            kind=SpanKind.CLIENT,
+            attributes=attributes,
+            record_exception=False,
+            set_status_on_exception=False,
+        ) as span:
+            try:
+                result = await call(provider, target)
+            except ProviderError as exc:
+                error = str(exc.status_code) if exc.status_code else type(exc).__name__
+                span.set_attribute("error.type", error)
+                span.set_status(Status(StatusCode.ERROR))
+                raise
+            if isinstance(result, ChatResponse):
+                span.set_attributes(_usage_attributes(result.usage))
+                span.set_attribute("gen_ai.response.model", result.model)
+            return result
+
+    return traced
+
+
+def _traced_sleep(tracer: Tracer) -> Callable[[float], Awaitable[None]]:
+    """asyncio.sleep, shown in the trace as a "retry wait" span."""
+
+    async def sleep(seconds: float) -> None:
+        with tracer.start_as_current_span(
+            "retry wait", attributes={"gateway.wait_seconds": seconds}
+        ):
+            await asyncio.sleep(seconds)
+
+    return sleep
+
+
+def _usage_attributes(usage: Usage) -> dict[str, int]:
+    return {
+        "gen_ai.usage.input_tokens": usage.prompt_tokens,
+        "gen_ai.usage.output_tokens": usage.completion_tokens,
+    }
+
+
 @dataclasses.dataclass
 class _Trace:
-    """What the request log needs, collected while 1 chat request runs."""
+    """What the request log and the request's root span need, collected while it runs."""
 
     log: RequestRecorder
     client: str
     requested_model: str
     stream: bool
+    span: Span = dataclasses.field(default_factory=get_current_span)  # opened by the middleware
     id: str = dataclasses.field(default_factory=lambda: f"req-{uuid.uuid4().hex}")
     created_at: datetime.datetime = dataclasses.field(
         default_factory=lambda: datetime.datetime.now(datetime.UTC)
@@ -292,6 +371,7 @@ class _Trace:
         first_chunk_ms: float | None = None,
     ) -> None:
         last = self.attempts[-1].target if self.attempts else None
+        self._annotate_span(last, error_type, usage, cost_usd, first_chunk_ms)
         self.log.record(
             RequestRecord(
                 id=self.id,
@@ -312,6 +392,40 @@ class _Trace:
             )
         )
 
+    def _annotate_span(
+        self,
+        last: Target | None,
+        error_type: str | None,
+        usage: Usage | None,
+        cost_usd: float | None,
+        first_chunk_ms: float | None,
+    ) -> None:
+        """Put the request's outcome on its root span, using the log row's numbers."""
+        attributes: dict[str, str | bool | int | float] = {
+            "gateway.request_id": self.id,
+            "gateway.stream": self.stream,
+            "gateway.attempts": len(self.attempts),
+            "gen_ai.operation.name": "chat",
+            "gen_ai.request.model": self.requested_model,
+        }
+        if last is not None:  # the target that answered, or was tried last
+            attributes["gen_ai.provider.name"] = last.provider
+            attributes["gateway.target"] = str(last)
+            if error_type is None:
+                attributes["gen_ai.response.model"] = str(last)
+        if usage is not None:
+            attributes.update(_usage_attributes(usage))
+        if cost_usd is not None:
+            attributes["gateway.cost_usd"] = cost_usd
+        if first_chunk_ms is not None:
+            attributes["gateway.first_chunk_ms"] = first_chunk_ms
+        if error_type is not None:
+            attributes["error.type"] = error_type
+            # A bad request or a client hanging up is the client's doing, not a fault here.
+            if error_type not in ("invalid_request_error", "client_disconnected"):
+                self.span.set_status(Status(StatusCode.ERROR))
+        self.span.set_attributes(attributes)
+
 
 @router.post("/v1/chat/completions", response_model=ChatCompletion)
 async def chat_completions(
@@ -323,9 +437,11 @@ async def chat_completions(
     prices: Annotated[PriceTable, Depends(get_prices)],
     client: Annotated[Client, Depends(authenticate)],
     request_log: Annotated[RequestRecorder, Depends(get_request_log)],
+    tracer: Annotated[Tracer, Depends(get_request_tracer)],
 ) -> ChatCompletion | StreamingResponse:
     """Every request that gets past the key check and rate limit is written to the log."""
     trace = _Trace(request_log, client.name, body.model, body.stream)
+    trace.span.set_attribute("gateway.request_id", trace.id)
     try:
         targets = _targets(body, providers, settings)
         base = ChatRequest.model_validate(body.model_dump(exclude={"stream"}))
@@ -336,14 +452,21 @@ async def chat_completions(
 
         if body.stream:
             headers = {**limits.headers(), "x-gateway-request-id": trace.id}
-            return await _stream(targets, providers, policy, request_for, headers, prices, trace)
+            return await _stream(
+                targets, providers, policy, request_for, headers, prices, trace, tracer
+            )
 
         async def call(provider: Provider, target: Target) -> ChatResponse:
             return await provider.chat(request_for(target))
 
         try:
             reply, target, attempts = await run_with_fallback(
-                targets, providers, call, policy, attempts=trace.attempts
+                targets,
+                providers,
+                _traced_call(tracer, call),
+                policy,
+                sleep=_traced_sleep(tracer),
+                attempts=trace.attempts,
             )
         except ProviderError as exc:
             raise _to_gateway_error(exc) from None
@@ -389,6 +512,7 @@ async def _stream(
     extra_headers: dict[str, str],
     prices: PriceTable,
     trace: _Trace,
+    tracer: Tracer,
 ) -> StreamingResponse:
     """Stream the reply as OpenAI chat.completion.chunk events, ending with [DONE].
 
@@ -414,7 +538,12 @@ async def _stream(
 
     try:
         (chunks, first), target, attempts = await run_with_fallback(
-            targets, providers, open_stream, policy, attempts=trace.attempts
+            targets,
+            providers,
+            _traced_call(tracer, open_stream),
+            policy,
+            sleep=_traced_sleep(tracer),
+            attempts=trace.attempts,
         )
     except ProviderError as exc:
         raise _to_gateway_error(exc) from None
