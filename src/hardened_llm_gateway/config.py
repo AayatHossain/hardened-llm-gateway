@@ -1,9 +1,9 @@
 """Gateway settings, read from environment variables and an optional .env file."""
 
 from functools import lru_cache
-from typing import Literal
+from typing import Literal, Self
 
-from pydantic import BaseModel, Field, SecretStr, field_validator
+from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -66,8 +66,13 @@ class Settings(BaseSettings):
     # Postgres later: postgresql+asyncpg://user:password@host/db
     request_log_url: str = "sqlite+aiosqlite:///gateway.db"
 
-    # Where OpenTelemetry spans go: "off", or "console" (printed as JSON). See tracing.py.
-    tracing: Literal["off", "console"] = "off"
+    # Where OpenTelemetry spans go: "off", "console" (printed as JSON) or "langfuse".
+    # See tracing.py.
+    tracing: Literal["off", "console", "langfuse"] = "off"
+    # Langfuse project keys (Settings > API Keys), needed when tracing is "langfuse".
+    langfuse_public_key: str | None = None
+    langfuse_secret_key: SecretStr | None = None
+    langfuse_base_url: str = "https://cloud.langfuse.com"
 
     @field_validator("fallbacks")
     @classmethod
@@ -85,6 +90,17 @@ class Settings(BaseSettings):
         if len(hashes) != len(set(hashes)):
             raise ValueError("2 clients share the same key")
         return value
+
+    @model_validator(mode="after")
+    def _langfuse_has_keys(self) -> Self:
+        if self.tracing == "langfuse" and not (
+            self.langfuse_public_key and self.langfuse_secret_key
+        ):
+            raise ValueError(
+                "GATEWAY_TRACING=langfuse needs GATEWAY_LANGFUSE_PUBLIC_KEY and "
+                "GATEWAY_LANGFUSE_SECRET_KEY"
+            )
+        return self
 
 
 @lru_cache

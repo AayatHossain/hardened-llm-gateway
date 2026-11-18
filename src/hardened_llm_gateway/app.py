@@ -42,7 +42,7 @@ def create_app(
         logger.warning("no clients configured (GATEWAY_CLIENTS): every /v1 request will get 401")
     own_tracer_provider = None
     if tracer_provider is None:
-        tracer_provider = own_tracer_provider = build_tracer_provider(resolved_settings.tracing)
+        tracer_provider = own_tracer_provider = build_tracer_provider(resolved_settings)
     tracer = get_tracer(tracer_provider)
 
     @asynccontextmanager

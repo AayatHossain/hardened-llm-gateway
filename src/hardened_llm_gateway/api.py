@@ -24,7 +24,15 @@ from typing import Annotated, Any, Literal
 from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from opentelemetry.trace import Span, SpanKind, Status, StatusCode, Tracer, get_current_span
+from opentelemetry.trace import (
+    Span,
+    SpanKind,
+    Status,
+    StatusCode,
+    Tracer,
+    get_current_span,
+    use_span,
+)
 from pydantic import BaseModel
 
 from hardened_llm_gateway.config import Settings
@@ -170,7 +178,7 @@ async def enforce_rate_limit(
 
     Async on purpose: it then runs in the request's own task, inside its trace.
     """
-    get_current_span().set_attribute("gateway.client", client.name)
+    get_current_span().set_attribute("user.id", client.name)  # the OpenTelemetry name
     with tracer.start_as_current_span("rate limit") as span:
         result = limiter.check(client.name, client.requests_per_minute)
         span.set_attributes(
@@ -287,62 +295,94 @@ def get_request_log(request: Request) -> RequestRecorder:
     return request_log
 
 
-def _traced_call[T](
-    tracer: Tracer, call: Callable[[Provider, Target], Awaitable[T]]
-) -> Callable[[Provider, Target], Awaitable[T]]:
-    """`call` with 1 span per attempt, named and described as OpenTelemetry GenAI asks."""
-    attempt = 0
+class _ModelCalls:
+    """The "chat <target>" span of every attempt, with the OpenTelemetry GenAI names.
 
-    async def traced(provider: Provider, target: Target) -> T:
-        nonlocal attempt
-        attempt += 1
-        attributes: dict[str, str | int] = {
-            "gen_ai.operation.name": "chat",
-            "gen_ai.provider.name": target.provider,
-            "gen_ai.request.model": target.model,
-            "gateway.target": str(target),
-            "gateway.attempt": attempt,
-        }
-        # Exceptions are described by hand: their text can quote the provider's reply.
-        with tracer.start_as_current_span(
-            f"chat {target}",
-            kind=SpanKind.CLIENT,
-            attributes=attributes,
-            record_exception=False,
-            set_status_on_exception=False,
-        ) as span:
+    These are the only spans with gen_ai.* attributes, so tools such as Langfuse count
+    each model call's tokens and cost once. A streamed reply's successful attempt stays
+    open until the stream ends (see `end_stream`): only then are its tokens known.
+    """
+
+    def __init__(self, tracer: Tracer, prices: PriceTable, *, stream: bool) -> None:
+        self._tracer = tracer
+        self._prices = prices
+        self._stream = stream
+        self._attempt = 0
+        self._open: tuple[Span, Target] | None = None
+
+    def traced[T](
+        self, call: Callable[[Provider, Target], Awaitable[T]]
+    ) -> Callable[[Provider, Target], Awaitable[T]]:
+        async def traced_call(provider: Provider, target: Target) -> T:
+            self._attempt += 1
+            span = self._tracer.start_span(
+                f"chat {target}",
+                kind=SpanKind.CLIENT,
+                attributes={
+                    "gen_ai.operation.name": "chat",
+                    "gen_ai.provider.name": target.provider,
+                    "gen_ai.request.model": target.model,
+                    "gateway.target": str(target),
+                    "gateway.attempt": self._attempt,
+                },
+            )
             try:
-                result = await call(provider, target)
+                # Exceptions are described by hand: their text can quote the provider.
+                with use_span(span, record_exception=False, set_status_on_exception=False):
+                    result = await call(provider, target)
             except ProviderError as exc:
                 error = str(exc.status_code) if exc.status_code else type(exc).__name__
                 span.set_attribute("error.type", error)
                 span.set_status(Status(StatusCode.ERROR))
+                span.end()
+                raise
+            except BaseException:
+                span.end()
                 raise
             if isinstance(result, ChatResponse):
-                span.set_attributes(_usage_attributes(result.usage))
+                span.set_attributes(self._usage(target, result.usage))
                 span.set_attribute("gen_ai.response.model", result.model)
+            if self._stream:
+                self._open = (span, target)
+            else:
+                span.end()
             return result
 
-    return traced
+        return traced_call
 
-
-def _traced_sleep(tracer: Tracer) -> Callable[[float], Awaitable[None]]:
-    """asyncio.sleep, shown in the trace as a "retry wait" span."""
-
-    async def sleep(seconds: float) -> None:
-        with tracer.start_as_current_span(
+    async def sleep(self, seconds: float) -> None:
+        """asyncio.sleep, shown in the trace as a "retry wait" span."""
+        with self._tracer.start_as_current_span(
             "retry wait", attributes={"gateway.wait_seconds": seconds}
         ):
             await asyncio.sleep(seconds)
 
-    return sleep
+    def end_stream(
+        self, usage: Usage | None, first_chunk_ms: float, error_type: str | None
+    ) -> None:
+        """End the streamed reply's span, now that its tokens are known."""
+        if self._open is None:
+            return
+        span, target = self._open
+        self._open = None
+        span.set_attribute("gateway.first_chunk_ms", first_chunk_ms)
+        if usage is not None:
+            span.set_attributes(self._usage(target, usage))
+        if error_type is not None:
+            span.set_attribute("error.type", error_type)
+            if error_type != "client_disconnected":
+                span.set_status(Status(StatusCode.ERROR))
+        span.end()
 
-
-def _usage_attributes(usage: Usage) -> dict[str, int]:
-    return {
-        "gen_ai.usage.input_tokens": usage.prompt_tokens,
-        "gen_ai.usage.output_tokens": usage.completion_tokens,
-    }
+    def _usage(self, target: Target, usage: Usage) -> dict[str, int | float]:
+        attributes: dict[str, int | float] = {
+            "gen_ai.usage.input_tokens": usage.prompt_tokens,
+            "gen_ai.usage.output_tokens": usage.completion_tokens,
+        }
+        cost = self._prices.cost_usd(str(target), usage)
+        if cost is not None:  # unknown stays unset, never 0
+            attributes["gen_ai.usage.cost"] = cost
+        return attributes
 
 
 @dataclasses.dataclass
@@ -400,21 +440,22 @@ class _Trace:
         cost_usd: float | None,
         first_chunk_ms: float | None,
     ) -> None:
-        """Put the request's outcome on its root span, using the log row's numbers."""
+        """Put the request's outcome on its root span, using the log row's numbers.
+
+        gateway.* names, not gen_ai.*: the tokens and cost are already on the model
+        call's span, and must not be counted twice.
+        """
         attributes: dict[str, str | bool | int | float] = {
             "gateway.request_id": self.id,
             "gateway.stream": self.stream,
             "gateway.attempts": len(self.attempts),
-            "gen_ai.operation.name": "chat",
-            "gen_ai.request.model": self.requested_model,
+            "gateway.requested_model": self.requested_model,
         }
         if last is not None:  # the target that answered, or was tried last
-            attributes["gen_ai.provider.name"] = last.provider
             attributes["gateway.target"] = str(last)
-            if error_type is None:
-                attributes["gen_ai.response.model"] = str(last)
         if usage is not None:
-            attributes.update(_usage_attributes(usage))
+            attributes["gateway.usage.input_tokens"] = usage.prompt_tokens
+            attributes["gateway.usage.output_tokens"] = usage.completion_tokens
         if cost_usd is not None:
             attributes["gateway.cost_usd"] = cost_usd
         if first_chunk_ms is not None:
@@ -442,6 +483,7 @@ async def chat_completions(
     """Every request that gets past the key check and rate limit is written to the log."""
     trace = _Trace(request_log, client.name, body.model, body.stream)
     trace.span.set_attribute("gateway.request_id", trace.id)
+    calls = _ModelCalls(tracer, prices, stream=body.stream)
     try:
         targets = _targets(body, providers, settings)
         base = ChatRequest.model_validate(body.model_dump(exclude={"stream"}))
@@ -453,7 +495,7 @@ async def chat_completions(
         if body.stream:
             headers = {**limits.headers(), "x-gateway-request-id": trace.id}
             return await _stream(
-                targets, providers, policy, request_for, headers, prices, trace, tracer
+                targets, providers, policy, request_for, headers, prices, trace, calls
             )
 
         async def call(provider: Provider, target: Target) -> ChatResponse:
@@ -463,9 +505,9 @@ async def chat_completions(
             reply, target, attempts = await run_with_fallback(
                 targets,
                 providers,
-                _traced_call(tracer, call),
+                calls.traced(call),
                 policy,
-                sleep=_traced_sleep(tracer),
+                sleep=calls.sleep,
                 attempts=trace.attempts,
             )
         except ProviderError as exc:
@@ -512,7 +554,7 @@ async def _stream(
     extra_headers: dict[str, str],
     prices: PriceTable,
     trace: _Trace,
-    tracer: Tracer,
+    calls: _ModelCalls,
 ) -> StreamingResponse:
     """Stream the reply as OpenAI chat.completion.chunk events, ending with [DONE].
 
@@ -540,9 +582,9 @@ async def _stream(
         (chunks, first), target, attempts = await run_with_fallback(
             targets,
             providers,
-            _traced_call(tracer, open_stream),
+            calls.traced(open_stream),
             policy,
-            sleep=_traced_sleep(tracer),
+            sleep=calls.sleep,
             attempts=trace.attempts,
         )
     except ProviderError as exc:
@@ -587,6 +629,7 @@ async def _stream(
             return
         finally:
             await chunks.aclose()  # also runs when the client disconnects early
+            calls.end_stream(usage, first_chunk_ms, error_type)
             # The client already got status 200 with the headers, whatever happened next.
             trace.finish(
                 200,
