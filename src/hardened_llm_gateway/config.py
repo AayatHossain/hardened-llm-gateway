@@ -1,6 +1,7 @@
 """Gateway settings, read from environment variables and an optional .env file."""
 
 from functools import lru_cache
+from typing import Literal
 
 from pydantic import BaseModel, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -64,6 +65,9 @@ class Settings(BaseSettings):
     # Where the request log is written (SQLAlchemy URL). Empty turns the log off.
     # Postgres later: postgresql+asyncpg://user:password@host/db
     request_log_url: str = "sqlite+aiosqlite:///gateway.db"
+
+    # Where OpenTelemetry spans go: "off", or "console" (printed as JSON). See tracing.py.
+    tracing: Literal["off", "console"] = "off"
 
     @field_validator("fallbacks")
     @classmethod
