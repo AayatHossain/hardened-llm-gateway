@@ -11,8 +11,9 @@
 - **Rate limits.** Calls to each provider are spaced to stay under its free-tier
   requests per minute (`PROVIDER_RPM`), shared by model and judge calls. Rate limits
   (429) and timeouts (503, 504) are retried, waiting up to 60 s.
-- **Daily quotas.** A rate limit that cannot be waited out (usually a daily quota)
-  stops the run instead of failing every item that is left. The run is marked
+- **Daily quotas.** A rate limit asking for a short wait (a per-minute limit) is
+  waited out, however often it comes back. One that cannot be waited out (usually a
+  daily quota) stops the run instead of failing every item that is left. The run is marked
   incomplete; running the same command later finishes it.
 - **Cache.** Model replies and judge verdicts are cached in runs/cache/, so a crashed,
   stopped or repeated run only pays for what is new.
@@ -71,6 +72,12 @@ PROVIDER_RPM: dict[str, float] = {"groq": 25, "gemini": 8, "nvidia": 35, "openro
 DEFAULT_RPM = 10.0
 
 RUN_RETRY = RetryPolicy(max_retries=5, backoff_seconds=2.0, max_wait_seconds=60.0)
+# A 429 asking for a wait this short is a per-minute limit (requests or tokens): it
+# lifts by itself, so it is waited out without counting as a retry, for up to
+# RATE_LIMIT_PATIENCE_SECONDS per call. A longer wait, or none given, is likely a
+# daily quota: after RUN_RETRY gives up, the run stops (QuotaExhausted).
+SHORT_LIMIT_SECONDS = 60.0
+RATE_LIMIT_PATIENCE_SECONDS = 600.0
 # Rate limits and timeouts are worth waiting for. A 502 is not: the gateway has already
 # retried the provider, and it also means a bad key or a broken reply.
 _RETRY_STATUSES = (429, 503, 504)
@@ -117,19 +124,30 @@ class Pacers:
 
 
 class PacedProvider:
-    """A provider whose chat calls wait for a pacer first (used for the judge)."""
+    """A provider for the judge: each call waits for a pacer, and short rate limits
+    (see SHORT_LIMIT_SECONDS) are waited out like the model's."""
 
-    def __init__(self, inner: Provider, pacer: Pacer) -> None:
+    def __init__(self, inner: Provider, pacer: Pacer, sleep: Sleep = asyncio.sleep) -> None:
         self._inner = inner
         self._pacer = pacer
+        self._sleep = sleep
 
     @property
     def name(self) -> str:
         return self._inner.name
 
     async def chat(self, request: ChatRequest) -> ChatResponse:
-        await self._pacer.wait()
-        return await self._inner.chat(request)
+        limited_for = 0.0
+        while True:
+            await self._pacer.wait()
+            try:
+                return await self._inner.chat(request)
+            except ProviderError as exc:
+                if not _is_short_limit(exc) or limited_for >= RATE_LIMIT_PATIENCE_SECONDS:
+                    raise
+                assert exc.retry_after_seconds is not None
+                limited_for += exc.retry_after_seconds
+                await self._sleep(exc.retry_after_seconds)
 
     def stream(self, request: ChatRequest) -> AsyncGenerator[ChatChunk]:
         return self._inner.stream(request)
@@ -213,6 +231,7 @@ async def ask_model(
         "max_tokens": options.max_tokens,
     }
     retry_number = 0
+    limited_for = 0.0  # seconds spent waiting out short rate limits
     while True:
         await pacer.wait()
         response = await client.post("/v1/chat/completions", json=body)
@@ -226,6 +245,12 @@ async def ask_model(
             retryable=response.status_code in _RETRY_STATUSES,
             retry_after_seconds=_float(response.headers.get("retry-after")),
         )
+        if _is_short_limit(error) and limited_for < RATE_LIMIT_PATIENCE_SECONDS:
+            # A per-minute limit lifts by itself, however often it comes back.
+            assert error.retry_after_seconds is not None
+            limited_for += error.retry_after_seconds
+            await sleep(error.retry_after_seconds)
+            continue
         retry_number += 1
         wait = RUN_RETRY.delay(retry_number, error)
         if wait is None:
@@ -233,6 +258,12 @@ async def ask_model(
                 raise QuotaExhausted(message, error.retry_after_seconds)
             raise ModelCallError(message)
         await sleep(wait)
+
+
+def _is_short_limit(error: ProviderError) -> bool:
+    """A 429 that says to come back soon: a per-minute limit, not a daily quota."""
+    seconds = error.retry_after_seconds
+    return error.status_code == 429 and seconds is not None and seconds <= SHORT_LIMIT_SECONDS
 
 
 def _reply(response: httpx.Response) -> dict[str, Any]:
@@ -481,7 +512,7 @@ async def run_eval(
                 "gateway", "http://gateway/v1", gateway.key, gateway.client, timeout_seconds=300
             )
             judge = Judge(
-                {"gateway": PacedProvider(via_gateway, pacers.for_target(judge_target))},
+                {"gateway": PacedProvider(via_gateway, pacers.for_target(judge_target), sleep)},
                 f"gateway/{judge_target}",
                 cache=JsonlCache(paths.cache / "judge.jsonl"),
                 sleep=sleep,
