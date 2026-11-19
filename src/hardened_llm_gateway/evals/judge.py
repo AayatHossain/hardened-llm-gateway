@@ -18,16 +18,15 @@ for replies, prompts or judge models it has not seen before.
 """
 
 import asyncio
-import hashlib
 import json
 import re
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, Field, ValidationError
 
+from hardened_llm_gateway.evals.cache import JsonlCache, request_key
 from hardened_llm_gateway.evals.dataset import EvalItem
 from hardened_llm_gateway.evals.graders import Grade
 from hardened_llm_gateway.fallback import RetryPolicy, Target, run_with_fallback
@@ -106,39 +105,13 @@ class JudgeUsage:
     completion_tokens: int = 0
 
 
-class JudgeCache:
-    """Verdicts by request hash, kept in a JSON Lines file (or only in memory)."""
-
-    def __init__(self, path: Path | None = None) -> None:
-        self._path = path
-        self._entries: dict[str, str] = {}
-        if path is not None and path.exists():
-            for line in path.read_text(encoding="utf-8").splitlines():
-                if line.strip():
-                    entry = json.loads(line)
-                    self._entries[entry["key"]] = entry["content"]
-
-    def __len__(self) -> int:
-        return len(self._entries)
-
-    def get(self, key: str) -> str | None:
-        return self._entries.get(key)
-
-    def put(self, key: str, content: str) -> None:
-        self._entries[key] = content
-        if self._path is not None:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            with self._path.open("a", encoding="utf-8", newline="\n") as file:
-                file.write(json.dumps({"key": key, "content": content}) + "\n")
-
-
 class Judge:
     def __init__(
         self,
         providers: Mapping[str, Provider],
         target: str = DEFAULT_JUDGE,
         *,
-        cache: JudgeCache | None = None,
+        cache: JsonlCache | None = None,
         policy: RetryPolicy = JUDGE_RETRY,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         max_tokens: int = 2000,  # room for a reasoning model's thinking
@@ -151,7 +124,7 @@ class Judge:
         self.target = parsed
         self.usage = JudgeUsage()
         self._providers = providers
-        self._cache = cache if cache is not None else JudgeCache()
+        self._cache = cache if cache is not None else JsonlCache()
         self._policy = policy
         self._sleep = sleep
         self._max_tokens = max_tokens
@@ -172,10 +145,12 @@ class Judge:
             temperature=0,
             max_tokens=self._max_tokens,
         )
-        key = _request_key(str(self.target), request)
+        key = request_key(
+            kind="judge", version=PROMPT_VERSION, judge=str(self.target), **request.model_dump()
+        )
         if (cached := self._cache.get(key)) is not None:
             self.usage.cached += 1
-            return read(cached)
+            return read(cached["content"])
         problem = ""
         for _ in range(2):  # ask once more if the verdict cannot be read
             content = await self._ask(request)
@@ -184,7 +159,7 @@ class Judge:
             except JudgeError as exc:
                 problem = str(exc)
                 continue
-            self._cache.put(key, content)
+            self._cache.put(key, {"content": content})
             return grade
         raise JudgeError(problem)
 
@@ -267,8 +242,3 @@ def _read_chat(content: str) -> Grade:
     return Grade(
         verdict.rating >= PASS_RATING, str(verdict.rating), verdict.reason, verdict.rating / 10
     )
-
-
-def _request_key(target: str, request: ChatRequest) -> str:
-    payload = {"version": PROMPT_VERSION, "judge": target, **request.model_dump()}
-    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
