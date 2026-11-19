@@ -11,8 +11,11 @@
 - **Rate limits.** Calls to each provider are spaced to stay under its free-tier
   requests per minute (`PROVIDER_RPM`), shared by model and judge calls. Rate limits
   (429) and timeouts (503, 504) are retried, waiting up to 60 s.
-- **Cache.** Model replies and judge verdicts are cached in runs/cache/, so a crashed
-  or repeated run only pays for what is new.
+- **Daily quotas.** A rate limit that cannot be waited out (usually a daily quota)
+  stops the run instead of failing every item that is left. The run is marked
+  incomplete; running the same command later finishes it.
+- **Cache.** Model replies and judge verdicts are cached in runs/cache/, so a crashed,
+  stopped or repeated run only pays for what is new.
 
 Each run writes to runs/<time>-<model>/:
 - `run.json`: what was run (model, settings, the eval set's fingerprint) and a summary;
@@ -23,6 +26,7 @@ Each run writes to runs/<time>-<model>/:
 import argparse
 import asyncio
 import json
+import math
 import re
 import secrets
 import subprocess
@@ -60,6 +64,7 @@ from hardened_llm_gateway.report import percentile
 
 EVAL_CLIENT = "eval-runner"
 DATA = Path("evals/data")
+STOPPED_EXIT = 3  # the command's exit code when a quota stopped the run early
 
 # Free-tier requests per minute, a little under the published limits.
 PROVIDER_RPM: dict[str, float] = {"groq": 25, "gemini": 8, "nvidia": 35, "openrouter": 15}
@@ -181,6 +186,18 @@ class ModelCallError(Exception):
     """The gateway did not return a reply, even after retrying."""
 
 
+class QuotaExhausted(Exception):
+    """A rate limit that retrying cannot get past within the run, e.g. a daily quota.
+
+    It says nothing about the model, so the item is not scored: the run stops, and a
+    later run picks up where it left off.
+    """
+
+    def __init__(self, message: str, retry_after_seconds: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
+
+
 async def ask_model(
     client: httpx.AsyncClient,
     item: EvalItem,
@@ -212,6 +229,8 @@ async def ask_model(
         retry_number += 1
         wait = RUN_RETRY.delay(retry_number, error)
         if wait is None:
+            if response.status_code == 429:
+                raise QuotaExhausted(message, error.retry_after_seconds)
             raise ModelCallError(message)
         await sleep(wait)
 
@@ -260,15 +279,27 @@ async def run_items(
     results: Path,
     sleep: Sleep = asyncio.sleep,
     progress: Callable[[int, int, dict[str, Any]], None] | None = None,
-) -> list[dict[str, Any]]:
-    """Ask, grade and record every item; return the records in the items' order."""
+) -> tuple[list[dict[str, Any]], QuotaExhausted | None]:
+    """Ask, grade and record the items.
+
+    Returns the finished records in the items' order, and what stopped the run early,
+    if anything. After a stop, items not yet started are skipped; the few already
+    waiting on a call may still finish.
+    """
     semaphore = asyncio.Semaphore(options.concurrency)
     pacer = pacers.for_target(options.model)
     records: dict[str, dict[str, Any]] = {}
+    stops: list[QuotaExhausted] = []
 
     async def one(item: EvalItem) -> None:
         async with semaphore:
-            record = await _run_one(item, options, client, judge, cache, pacer, sleep)
+            if stops:
+                return
+            try:
+                record = await _run_one(item, options, client, judge, cache, pacer, sleep)
+            except QuotaExhausted as exc:
+                stops.append(exc)
+                return
         records[item.id] = record
         with results.open("a", encoding="utf-8", newline="\n") as file:
             file.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -276,7 +307,8 @@ async def run_items(
             progress(len(records), len(items), record)
 
     await asyncio.gather(*(one(item) for item in items.items))
-    return [records[item.id] for item in items.items]
+    finished = [records[item.id] for item in items.items if item.id in records]
+    return finished, stops[0] if stops else None
 
 
 async def _run_one(
@@ -325,7 +357,11 @@ async def _run_one(
             result = await asyncio.to_thread(grade, item, reply["reply"])
         else:
             result = grade(item, reply["reply"])
-    except (JudgeError, ProviderError) as exc:  # the judge's failure: not scored
+    except ProviderError as exc:
+        if exc.status_code == 429:  # the judge's quota: the reply is cached, judge it later
+            raise QuotaExhausted(f"judge: {exc}", exc.retry_after_seconds) from exc
+        return record | {"detail": f"judge failed: {exc}"}  # the judge's failure: not scored
+    except JudgeError as exc:
         return record | {"detail": f"judge failed: {exc}"}
     return record | {
         "passed": result.passed,
@@ -465,7 +501,7 @@ async def run_eval(
             "judge_prompt_version": PROMPT_VERSION,
         }
         _write_json(folder / "run.json", meta)
-        records = await run_items(
+        records, stop = await run_items(
             items,
             options,
             client=gateway.client,
@@ -478,7 +514,18 @@ async def run_eval(
         )
 
     meta["finished_at"] = datetime.now(UTC).isoformat(timespec="seconds")
-    meta["summary"] = summarize(records)
+    # An incomplete run's summary covers only the items it finished: do not report it.
+    meta["complete"] = stop is None
+    meta["stopped"] = (
+        None
+        if stop is None
+        else {
+            "reason": str(stop),
+            "retry_after_seconds": stop.retry_after_seconds,
+            "not_run": len(items) - len(records),
+        }
+    )
+    meta["summary"] = summarize(records) if records else None
     meta["judge_usage"] = asdict(judge.usage) if judge is not None else None
     _write_json(folder / "run.json", meta)
     return folder
@@ -513,6 +560,25 @@ def _git_commit() -> str | None:
 
 def _write_json(path: Path, data: Mapping[str, Any]) -> None:
     path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8", newline="\n")
+
+
+def format_stop(stopped: Mapping[str, Any]) -> str:
+    """What to tell the user when a run stopped early."""
+    seconds = stopped.get("retry_after_seconds")
+    when = "later" if seconds is None else f"in {_duration(seconds)} or later"
+    return (
+        f"stopped early: {stopped['reason']}\n"
+        f"{stopped['not_run']} items were not run, and this run is incomplete. Finished "
+        f"items are cached, so run the same command again {when} to finish."
+    )
+
+
+def _duration(seconds: float) -> str:
+    minutes = math.ceil(seconds / 60)
+    if minutes < 60:
+        return f"{minutes} min"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours} h {minutes} min" if minutes else f"{hours} h"
 
 
 # --- Command line ---
@@ -595,8 +661,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     run = json.loads((folder / "run.json").read_text(encoding="utf-8"))
-    print(format_summary(run["summary"]))
+    if run["summary"] is not None:
+        print(format_summary(run["summary"]))
     print(f"\nresults: {folder}")
+    if run["stopped"] is not None:
+        print(format_stop(run["stopped"]), file=sys.stderr)
+        return STOPPED_EXIT
     return 0
 
 
