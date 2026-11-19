@@ -14,9 +14,11 @@ from hardened_llm_gateway.evals.dataset import EvalItem, EvalSet
 from hardened_llm_gateway.evals.run import (
     ModelCallError,
     Pacer,
+    QuotaExhausted,
     RunOptions,
     RunPaths,
     ask_model,
+    format_stop,
     format_summary,
     main,
     run_eval,
@@ -130,7 +132,7 @@ async def no_sleep(seconds: float) -> None:
 async def run(tmp_path: Path, model: Scripted, judge: Scripted, **options: Any) -> Path:
     return await run_eval(
         ITEMS,
-        RunOptions(MODEL),
+        options.pop("run_options", RunOptions(MODEL)),
         settings=Settings(request_log_url=""),
         providers={"groq": model, "gemini": judge},
         judge_target=options.pop("judge_target", JUDGE),
@@ -225,6 +227,66 @@ async def test_a_disabled_provider_stops_the_run_early(tmp_path: Path) -> None:
     assert model.prompts == []
 
 
+def quota(provider: str) -> ProviderError:
+    """What a provider raises when its daily quota is used up."""
+    return ProviderError(
+        provider, "HTTP 429", status_code=429, retryable=True, retry_after_seconds=7200
+    )
+
+
+ONE_AT_A_TIME = RunOptions(MODEL, concurrency=1)  # items run in order
+
+
+async def test_a_daily_quota_stops_the_run_without_scoring(tmp_path: Path) -> None:
+    model, judge = providers()
+    model.answers["pens"] = quota("groq")  # the 3rd item
+    folder = await run(tmp_path, model, judge, run_options=ONE_AT_A_TIME)
+
+    assert list(results(folder)) == ["france", "spain"]  # no fail recorded for "pens"
+    assert len(model.prompts) == 3  # nothing after the quota was asked
+    run_info = json.loads((folder / "run.json").read_text(encoding="utf-8"))
+    assert run_info["complete"] is False
+    assert run_info["stopped"] == {
+        "reason": "HTTP 429: provider 'groq' rate limit reached",
+        "retry_after_seconds": 7200,
+        "not_run": 5,
+    }
+    assert run_info["summary"]["total"]["items"] == 2
+
+
+async def test_a_stopped_run_is_finished_by_running_it_again(tmp_path: Path) -> None:
+    model, judge = providers()
+    judge.answers["Soft rain"] = quota("gemini")  # the judge runs out on "haiku"
+    first = await run(tmp_path, model, judge, run_options=ONE_AT_A_TIME)
+    first_info = json.loads((first / "run.json").read_text(encoding="utf-8"))
+    assert "haiku" not in results(first)
+    assert first_info["stopped"]["reason"].startswith("judge: gateway: HTTP 429")
+    assert first_info["stopped"]["not_run"] == 2  # "haiku" and "broken"
+
+    asked = len(model.prompts)
+    judge.answers["Soft rain"] = '{"reason": "Nice.", "rating": 8}'  # the next day
+    second = await run(tmp_path, model, judge, run_options=ONE_AT_A_TIME)
+    second_info = json.loads((second / "run.json").read_text(encoding="utf-8"))
+    assert (second_info["complete"], second_info["stopped"]) == (True, None)
+    assert results(second)["haiku"]["score"] == 0.8
+    # Only "broken" is asked: the 1st run never reached it. The "haiku" reply was
+    # cached before its judge ran out, so only the verdict is new.
+    assert len(model.prompts) == asked + 1
+    assert results(second)["haiku"]["cached"] is True
+
+
+def test_stop_message() -> None:
+    stopped = {"reason": "HTTP 429: slow", "retry_after_seconds": 7200, "not_run": 5}
+    assert format_stop(stopped) == (
+        "stopped early: HTTP 429: slow\n"
+        "5 items were not run, and this run is incomplete. Finished items are cached, "
+        "so run the same command again in 2 h or later to finish."
+    )
+    assert "again in 3 h 1 min or later" in format_stop(stopped | {"retry_after_seconds": 10801})
+    assert "again in 1 min or later" in format_stop(stopped | {"retry_after_seconds": 5})
+    assert "again later" in format_stop(stopped | {"retry_after_seconds": None})
+
+
 # --- Asking the model ---
 
 
@@ -285,6 +347,26 @@ async def test_rate_limits_are_waited_out() -> None:
         "target": "groq/m",
         "attempts": 2,
     }
+
+
+async def test_a_rate_limit_too_long_to_wait_is_a_quota() -> None:
+    daily = httpx.Response(
+        429, json={"error": {"message": "daily limit"}}, headers={"retry-after": "3600"}
+    )
+    client, seen = gateway_client(daily)
+    with pytest.raises(QuotaExhausted, match="HTTP 429: daily limit") as caught:
+        await ask_model(client, ITEMS.items[0], RunOptions("groq/m"), Pacer(60_000), no_sleep)
+    assert caught.value.retry_after_seconds == 3600
+    assert len(seen) == 1  # not worth retrying
+
+
+async def test_a_rate_limit_that_never_lifts_is_a_quota() -> None:
+    limited = httpx.Response(429, json={"error": {"message": "slow down"}})  # no retry-after
+    client, seen = gateway_client(*[limited] * 6)
+    with pytest.raises(QuotaExhausted) as caught:
+        await ask_model(client, ITEMS.items[0], RunOptions("groq/m"), Pacer(60_000), no_sleep)
+    assert caught.value.retry_after_seconds is None
+    assert len(seen) == 6  # the first try and 5 retries
 
 
 @pytest.mark.parametrize("status", [400, 401, 500, 502])

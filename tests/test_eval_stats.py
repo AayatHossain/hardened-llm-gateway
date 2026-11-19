@@ -167,6 +167,19 @@ def test_command_compares_2_runs(tmp_path: Path, capsys: pytest.CaptureFixture[s
     assert "maths         200   0.700   0.760   +0.060  [+0.030, +0.095]    0.0005 * mcnemar" in out
 
 
+def test_incomplete_runs_are_flagged(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    scores: dict[str, tuple[str, float | None]] = {"m1": ("maths", 1.0)}
+    stopped = write_run(tmp_path / "stopped", scores, complete=False)
+    whole = write_run(tmp_path / "whole", scores, complete=True)
+    warning = "warning: stopped is incomplete (stopped early)"
+    assert main([str(stopped)]) == 0
+    assert warning in capsys.readouterr().out
+    assert main([str(whole)]) == 0
+    assert "incomplete" not in capsys.readouterr().out
+    assert main([str(whole), str(stopped)]) == 0
+    assert warning in capsys.readouterr().out
+
+
 def test_command_errors(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     with pytest.raises(SystemExit):
         main(["a", "b", "c"])
