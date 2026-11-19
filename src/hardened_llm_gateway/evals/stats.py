@@ -199,7 +199,8 @@ def describe(run: Run, confidence: float = CONFIDENCE) -> str:
     for task, score in run.scores.values():
         groups.setdefault(task, []).append(score)
     every = [score for _, score in run.scores.values()]
-    lines = [run.label, "", f"{'task':<10}{'graded':>7}{'score':>8}  {_ci_header(confidence)}"]
+    lines = [run.label, "", *_incomplete([run])]
+    lines.append(f"{'task':<10}{'graded':>7}{'score':>8}  {_ci_header(confidence)}")
     for name, values in _by_task(groups, every).items():
         estimate = mean_interval(values, confidence)
         if estimate is not None:
@@ -241,8 +242,19 @@ def describe_comparison(a: Run, b: Run, confidence: float = CONFIDENCE) -> str:
     return "\n".join(lines)
 
 
+def _incomplete(runs: Sequence[Run]) -> list[str]:
+    """A warning for each run that stopped early (see run.QuotaExhausted)."""
+    notes = [
+        f"warning: {run.folder.name} is incomplete (stopped early): its items are not "
+        "the full selection"
+        for run in runs
+        if run.info.get("complete") is False
+    ]
+    return [*notes, ""] if notes else []
+
+
 def _warnings(a: Run, b: Run, shared: int) -> list[str]:
-    notes = []
+    notes = [line for line in _incomplete([a, b]) if line]
     if shared < max(len(a.scores), len(b.scores)):
         notes.append(
             f"note: {shared} items graded in both runs "
