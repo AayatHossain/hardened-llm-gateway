@@ -13,6 +13,7 @@ from hardened_llm_gateway.evals.cache import JsonlCache
 from hardened_llm_gateway.evals.dataset import EvalItem, EvalSet
 from hardened_llm_gateway.evals.run import (
     ModelCallError,
+    PacedProvider,
     Pacer,
     QuotaExhausted,
     RunOptions,
@@ -26,6 +27,7 @@ from hardened_llm_gateway.evals.run import (
 )
 from hardened_llm_gateway.providers import (
     ChatChunk,
+    ChatMessage,
     ChatRequest,
     ChatResponse,
     ProviderError,
@@ -358,6 +360,58 @@ async def test_a_rate_limit_too_long_to_wait_is_a_quota() -> None:
         await ask_model(client, ITEMS.items[0], RunOptions("groq/m"), Pacer(60_000), no_sleep)
     assert caught.value.retry_after_seconds == 3600
     assert len(seen) == 1  # not worth retrying
+
+
+def minute_limit(seconds: str = "8") -> httpx.Response:
+    return httpx.Response(
+        429, json={"error": {"message": "tokens per minute"}}, headers={"retry-after": seconds}
+    )
+
+
+async def test_a_per_minute_limit_is_waited_out_however_often_it_comes_back() -> None:
+    """Groq's tokens-per-minute limit can hit the same item many times in a row."""
+    waits: list[float] = []
+
+    async def sleep(seconds: float) -> None:
+        waits.append(seconds)
+
+    client, seen = gateway_client(*[minute_limit()] * 10, OK)
+    reply = await ask_model(client, ITEMS.items[0], RunOptions("groq/m"), Pacer(60_000), sleep)
+    assert reply["reply"] == "84"
+    assert waits == [8.0] * 10
+    assert len(seen) == 11
+
+
+async def test_patience_with_a_per_minute_limit_runs_out() -> None:
+    # 600 s of patience is 10 waits of 60 s; then the usual 5 retries; then a stop.
+    client, seen = gateway_client(*[minute_limit("60")] * 16)
+    with pytest.raises(QuotaExhausted, match="tokens per minute"):
+        await ask_model(client, ITEMS.items[0], RunOptions("groq/m"), Pacer(60_000), no_sleep)
+    assert len(seen) == 16
+
+
+async def test_the_judge_waits_out_a_per_minute_limit_too() -> None:
+    limited = ProviderError(
+        "gateway", "HTTP 429", status_code=429, retryable=True, retry_after_seconds=5
+    )
+    judge = Scripted("gateway", {"Who": limited})
+    waits: list[float] = []
+
+    async def sleep(seconds: float) -> None:
+        waits.append(seconds)
+        if len(waits) == 3:
+            judge.answers["Who"] = CORRECT  # the limit lifts
+
+    paced = PacedProvider(judge, Pacer(60_000), sleep)
+    request = ChatRequest(model="m", messages=[ChatMessage(role="user", content="Who wrote it?")])
+    response = await paced.chat(request)
+    assert response.content == CORRECT
+    assert waits == [5, 5, 5]
+
+    judge.answers["Who"] = quota("gateway")  # a daily quota is passed on at once
+    with pytest.raises(ProviderError, match="HTTP 429"):
+        await paced.chat(request)
+    assert waits == [5, 5, 5]
 
 
 async def test_a_rate_limit_that_never_lifts_is_a_quota() -> None:
