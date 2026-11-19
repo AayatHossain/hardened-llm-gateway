@@ -6,12 +6,12 @@ from typing import Any
 
 import pytest
 
+from hardened_llm_gateway.evals.cache import JsonlCache
 from hardened_llm_gateway.evals.dataset import EvalItem, load
 from hardened_llm_gateway.evals.graders import Grade
 from hardened_llm_gateway.evals.judge import (
     JUDGE_RETRY,
     Judge,
-    JudgeCache,
     JudgeError,
     chat_messages,
     facts_messages,
@@ -211,7 +211,7 @@ async def test_rate_limits_are_waited_out() -> None:
 
 
 async def test_verdicts_are_cached_by_request(tmp_path: Path) -> None:
-    cache = JudgeCache(tmp_path / "judge.jsonl")
+    cache = JsonlCache(tmp_path / "judge.jsonl")
     judge, model = judge_with(CORRECT, '{"reason": "No.", "grade": "INCORRECT"}', cache=cache)
     first = await judge.grade(facts_item(), "Sugeno")
     assert await judge.grade(facts_item(), "Sugeno") == first  # from the cache
@@ -221,13 +221,13 @@ async def test_verdicts_are_cached_by_request(tmp_path: Path) -> None:
     assert (judge.usage.prompt_tokens, judge.usage.completion_tokens) == (200, 40)
 
     # A new judge with the same file needs no calls.
-    again, unused = judge_with(cache=JudgeCache(tmp_path / "judge.jsonl"))
+    again, unused = judge_with(cache=JsonlCache(tmp_path / "judge.jsonl"))
     assert await again.grade(facts_item(), "Sugeno") == first
     assert unused.requests == []
 
 
 async def test_unreadable_verdicts_are_not_cached() -> None:
-    cache = JudgeCache()
+    cache = JsonlCache()
     judge, _ = judge_with("no verdict", "still none", cache=cache)
     with pytest.raises(JudgeError):
         await judge.grade(facts_item(), "Sugeno")
