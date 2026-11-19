@@ -26,7 +26,13 @@ from hardened_llm_gateway.evals.dataset import EvalItem, parse_number
 class Grade:
     passed: bool
     extracted: str | None  # what was read from the reply, for failure analysis
-    detail: str = ""  # why it failed, e.g. "expected 72, got 70"
+    detail: str = ""  # why it failed, e.g. "expected 72, got 70", or the judge's reason
+    score: float | None = None  # 0-1 for graders with a scale (judge ratings), else None
+
+    @property
+    def value(self) -> float:
+        """The score, or 1.0 / 0.0 for pass/fail graders."""
+        return self.score if self.score is not None else float(self.passed)
 
 
 # --- exact ---
@@ -207,7 +213,7 @@ def _shorten(text: str, limit: int = 200) -> str:
 
 
 def grade(item: EvalItem, reply: str) -> Grade:
-    """Score `reply` with the item's grader. Judge items need `judge.py` instead."""
+    """Score `reply` with the item's grader. Judge items need `judge.Judge` instead."""
     if item.grader == "exact":
         return grade_exact(item, reply)
     if item.grader == "numeric":
