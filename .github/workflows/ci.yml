@@ -48,3 +48,8 @@ jobs:
 
       - name: Test
         run: uv run pytest
+
+      # Replays recorded model replies through the gateway, graders and judge, and
+      # fails if any grade changes. No API calls, so no keys are needed.
+      - name: Eval gate
+        run: uv run python -m hardened_llm_gateway.evals.gate
