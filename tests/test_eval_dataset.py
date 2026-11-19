@@ -132,7 +132,19 @@ def test_sample_is_stable_and_grows_gently() -> None:
 
 
 @pytest.mark.parametrize(
-    ("text", "number"), [("84", 84.0), (" 1,234.5 ", 1234.5), ("-3", -3.0), ("7 pens", None)]
+    ("text", "number"),
+    [
+        ("84", 84.0),
+        (" 1,234.5 ", 1234.5),
+        ("-3", -3.0),
+        ("36.", 36.0),
+        (".5", 0.5),
+        ("7 pens", None),
+        ("Infinity", None),  # float() would accept these
+        ("nan", None),
+        ("1e3", None),
+        ("1,2,3", None),
+    ],
 )
 def test_parse_number(text: str, number: float | None) -> None:
     assert parse_number(text) == number

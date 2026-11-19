@@ -22,6 +22,7 @@ Check a file with `uv run python -m hardened_llm_gateway.evals.dataset <file.jso
 
 import hashlib
 import json
+import re
 import sys
 from collections import Counter
 from collections.abc import Iterable, Sequence
@@ -67,12 +68,19 @@ class EvalItem(BaseModel):
         return self
 
 
+_PLAIN_NUMBER = re.compile(r"[+-]?(?:(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d*)?|\.\d+)")
+
+
 def parse_number(text: str) -> float | None:
-    """'1,234.5' -> 1234.5; None if `text` is not a plain number."""
-    try:
-        return float(text.strip().replace(",", ""))
-    except ValueError:
+    """'1,234.5' -> 1234.5; None if `text` is not a plain number.
+
+    Only digits, thousands commas, a point and a sign: float() alone would also
+    accept "Infinity" and "nan", which are answers to some questions.
+    """
+    text = text.strip()
+    if not _PLAIN_NUMBER.fullmatch(text):
         return None
+    return float(text.replace(",", ""))
 
 
 class EvalFileError(ValueError):

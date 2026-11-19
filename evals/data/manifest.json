@@ -1,7 +1,7 @@
 {
   "seed": "eval-set-v1",
   "items": 1000,
-  "fingerprint": "6e8f9ac16ac7",
+  "fingerprint": "047f881e4b3b",
   "files": {
     "maths.jsonl": {
       "task": "maths",
@@ -30,7 +30,7 @@
       "items": 230,
       "dev": 69,
       "test": 161,
-      "fingerprint": "ea764dcf374b",
+      "fingerprint": "9dd6b6d2eaf6",
       "source": "SimpleQA",
       "licence": "MIT",
       "origin": "https://openaipublic.blob.core.windows.net/simple-evals/simple_qa_test_set.csv",
