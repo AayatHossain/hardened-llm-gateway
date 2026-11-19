@@ -338,9 +338,13 @@ def test_summary_counts_errors_as_fails_and_leaves_out_ungraded() -> None:
 
     text = format_summary(summary)
     assert text.splitlines()[0].split() == [
-        "task", "items", "passed", "rate", "score", "errors", "ungraded", "p50", "ms",
+        "task", "items", "passed", "rate", "score", "95%", "CI", "errors", "ungraded", "p50", "ms",
     ]  # fmt: skip
-    assert "maths          3       1   50.0%   0.50       1         1     100" in text
+    # 1 of 2 graded: a Wilson interval of [0.09, 0.91]; 2 items say very little.
+    assert (
+        "maths          3       1   50.0%   0.50  [0.09, 0.91]        1         1     100" in text
+    )
+    assert maths["score_ci"] == [pytest.approx(0.0945, abs=1e-4), pytest.approx(0.9055, abs=1e-4)]
     assert "cost $0.004000; 1 replies from the cache" in text
     assert text.endswith("1 replies were cut off at max tokens (--max-tokens)")
 
