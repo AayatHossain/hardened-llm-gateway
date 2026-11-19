@@ -1,0 +1,62 @@
+{
+  "seed": "eval-set-v1",
+  "items": 1000,
+  "fingerprint": "6e8f9ac16ac7",
+  "files": {
+    "maths.jsonl": {
+      "task": "maths",
+      "items": 230,
+      "dev": 69,
+      "test": 161,
+      "fingerprint": "9e77b5a55b95",
+      "source": "GSM8K test set",
+      "licence": "MIT",
+      "origin": "https://raw.githubusercontent.com/openai/grade-school-math/3101c7d5072418e28b9008a6636bde82a006892c/grade_school_math/data/test.jsonl",
+      "source_sha256": "3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14"
+    },
+    "code.jsonl": {
+      "task": "code",
+      "items": 230,
+      "dev": 69,
+      "test": 161,
+      "fingerprint": "af9324e5a5c2",
+      "source": "MBPP sanitized, test split",
+      "licence": "CC BY 4.0",
+      "origin": "https://raw.githubusercontent.com/google-research/google-research/e2c3f9b85ff9804147541060bf35d68bf14f2258/mbpp/sanitized-mbpp.json",
+      "source_sha256": "ca95deaa9a01ef0a6f439f88bcf0dd3db3563d22f22aad6cae04ebb9a8d8c8e9"
+    },
+    "facts.jsonl": {
+      "task": "facts",
+      "items": 230,
+      "dev": 69,
+      "test": 161,
+      "fingerprint": "ea764dcf374b",
+      "source": "SimpleQA",
+      "licence": "MIT",
+      "origin": "https://openaipublic.blob.core.windows.net/simple-evals/simple_qa_test_set.csv",
+      "source_sha256": "feee3f7e7db3617e94e8fcf1977b756ec420ef8568f4e0fcbbe0e92e9d5fc032"
+    },
+    "reasoning.jsonl": {
+      "task": "reasoning",
+      "items": 230,
+      "dev": 69,
+      "test": 161,
+      "fingerprint": "6939e6400a22",
+      "source": "ARC-Challenge test set",
+      "licence": "CC BY-SA 4.0",
+      "origin": "https://datasets-server.huggingface.co/rows?dataset=allenai/ai2_arc&config=ARC-Challenge&split=test",
+      "source_sha256": "91aa41fe25cea5d4366465e0b119959297855241d42e3afa6a902e64c9f07fd3"
+    },
+    "chat.jsonl": {
+      "task": "chat",
+      "items": 80,
+      "dev": 24,
+      "test": 56,
+      "fingerprint": "976f6e0726f1",
+      "source": "MT-Bench questions, first turn",
+      "licence": "Apache 2.0",
+      "origin": "https://raw.githubusercontent.com/lm-sys/FastChat/587d5cfa1609a43d192cedb8441cac3c17db105d/fastchat/llm_judge/data/mt_bench/question.jsonl",
+      "source_sha256": "119565adbab82227089cefdb44c8d7e2cf04dc0a0ec233634c82e7d4e2a944f7"
+    }
+  }
+}
