@@ -45,6 +45,7 @@ from hardened_llm_gateway.evals.cache import JsonlCache, request_key
 from hardened_llm_gateway.evals.dataset import SPLITS, TASKS, EvalFileError, EvalItem, EvalSet, load
 from hardened_llm_gateway.evals.graders import grade
 from hardened_llm_gateway.evals.judge import DEFAULT_JUDGE, PROMPT_VERSION, Judge, JudgeError
+from hardened_llm_gateway.evals.stats import mean_interval
 from hardened_llm_gateway.fallback import RetryPolicy
 from hardened_llm_gateway.keys import hash_key
 from hardened_llm_gateway.providers import (
@@ -356,12 +357,15 @@ def _summary(records: list[dict[str, Any]]) -> dict[str, Any]:
     graded = [r for r in records if r["passed"] is not None]
     costs = [r["cost_usd"] for r in records if r.get("cost_usd") is not None]
     latencies = [r["latency_ms"] for r in records if r.get("latency_ms") is not None]
+    interval = mean_interval([r["score"] for r in graded])
     return {
         "items": len(records),
         "graded": len(graded),
         "passed": sum(r["passed"] for r in graded),
         "pass_rate": sum(r["passed"] for r in graded) / len(graded) if graded else None,
-        "mean_score": sum(r["score"] for r in graded) / len(graded) if graded else None,
+        "mean_score": interval.mean if interval else None,
+        # 95% confidence interval of mean_score (see evals.stats)
+        "score_ci": [interval.low, interval.high] if interval else None,
         "errors": sum(r["error"] is not None for r in records),
         "ungraded": len(records) - len(graded),
         "cached": sum(bool(r.get("cached")) for r in records),
@@ -380,15 +384,16 @@ def format_summary(summary: Mapping[str, Mapping[str, Any]]) -> str:
         return "-" if value is None else f"{value:.1%}"
 
     lines = [
-        f"{'task':<10}{'items':>6}{'passed':>8}{'rate':>8}{'score':>7}{'errors':>8}"
-        f"{'ungraded':>10}{'p50 ms':>8}"
+        f"{'task':<10}{'items':>6}{'passed':>8}{'rate':>8}{'score':>7}  {'95% CI':<14}"
+        f"{'errors':>7}{'ungraded':>10}{'p50 ms':>8}"
     ]
     for name, s in summary.items():
         score = "-" if s["mean_score"] is None else f"{s['mean_score']:.2f}"
+        ci = "-" if s["score_ci"] is None else f"[{s['score_ci'][0]:.2f}, {s['score_ci'][1]:.2f}]"
         p50 = "-" if s["p50_ms"] is None else f"{s['p50_ms']:.0f}"
         lines.append(
-            f"{name:<10}{s['items']:>6}{s['passed']:>8}{pct(s['pass_rate']):>8}{score:>7}"
-            f"{s['errors']:>8}{s['ungraded']:>10}{p50:>8}"
+            f"{name:<10}{s['items']:>6}{s['passed']:>8}{pct(s['pass_rate']):>8}{score:>7}  "
+            f"{ci:<14}{s['errors']:>7}{s['ungraded']:>10}{p50:>8}"
         )
     total = summary["total"]
     cost = "unknown" if total["cost_usd"] is None else f"${total['cost_usd']:.6f}"
