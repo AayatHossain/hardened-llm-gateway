@@ -81,6 +81,11 @@ A reference answer is given. Correctness matters most: compare the reply with th
 reference answer and find any mistakes in the reply."""
 
 
+def _is_chat(item: EvalItem) -> bool:
+    """Chat-style grading (a rating), or facts-style (a grade against the answer)."""
+    return item.task == "chat" or not item.answer
+
+
 class JudgeError(Exception):
     """The judge's reply could not be read as a verdict, even after asking again."""
 
@@ -130,24 +135,29 @@ class Judge:
         self._max_tokens = max_tokens
 
     async def grade(self, item: EvalItem, reply: str) -> Grade:
+        request = self.request_for(item, reply)
+        read = _read_chat if _is_chat(item) else _read_facts
+        return await self._verdict(request, read)
+
+    def request_for(self, item: EvalItem, reply: str) -> ChatRequest:
+        """The request the judge sends to grade `reply` to `item`."""
         if item.grader != "judge":
             raise ValueError(f"{item.id}: grader is {item.grader!r}, not 'judge'")
-        if item.task != "chat" and item.answer:
-            messages = facts_messages(item, reply)
-            return await self._verdict(messages, _read_facts)
-        messages = chat_messages(item, reply)
-        return await self._verdict(messages, _read_chat)
-
-    async def _verdict(self, messages: list[ChatMessage], read: Callable[[str], Grade]) -> Grade:
-        request = ChatRequest(
+        messages = chat_messages(item, reply) if _is_chat(item) else facts_messages(item, reply)
+        return ChatRequest(
             model=self.target.model,
             messages=messages,
             temperature=0,
             max_tokens=self._max_tokens,
         )
-        key = request_key(
+
+    def cache_key(self, request: ChatRequest) -> str:
+        return request_key(
             kind="judge", version=PROMPT_VERSION, judge=str(self.target), **request.model_dump()
         )
+
+    async def _verdict(self, request: ChatRequest, read: Callable[[str], Grade]) -> Grade:
+        key = self.cache_key(request)
         if (cached := self._cache.get(key)) is not None:
             self.usage.cached += 1
             return read(cached["content"])
