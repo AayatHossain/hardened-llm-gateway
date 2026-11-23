@@ -7,7 +7,8 @@ With no run folders, it takes each model's newest run in runs/ that counts as a
 baseline. A run counts only if it:
 - finished every item (not stopped early by a quota);
 - covered the whole test split: every task, no --limit sample;
-- used the eval set the manifest describes now (the same fingerprint).
+- used the eval set the manifest describes now (the same fingerprint);
+- was graded by today's grading rules (`GRADING_VERSION`).
 
 Run folders given by hand must count too; otherwise the command says why not. So
 every number in the report is a full test-split result on today's eval set.
@@ -25,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from hardened_llm_gateway.evals.dataset import TASKS
+from hardened_llm_gateway.evals.run import GRADING_VERSION
 
 DATA = Path("evals/data")
 RUNS = Path("runs")
@@ -98,6 +100,12 @@ def problems(run: BaselineRun, eval_set: EvalSetInfo) -> list[str]:
     if selection.get("set_fingerprint") != eval_set.fingerprint:
         reasons.append(
             f"eval set {selection.get('set_fingerprint')}, not today's {eval_set.fingerprint}"
+        )
+    graded = info.get("grading_version", 1)  # runs from before the field are version 1
+    if graded != GRADING_VERSION:
+        reasons.append(
+            f"graded by older rules (version {graded}, now {GRADING_VERSION}); "
+            "rerun it: replies and verdicts come from the cache"
         )
     return reasons
 

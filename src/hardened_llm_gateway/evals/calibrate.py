@@ -22,6 +22,11 @@
 Because the sample is balanced over the judge's verdicts, the overall agreement is
 not the agreement on a typical run. The per-verdict rows are what generalise: "when
 the judge says pass, the person agrees X% of the time".
+
+Pass/fail rows score the pipeline as it grades now: a reply cut off at the token
+limit fails whatever the judge said (the runner no longer asks the judge about it).
+The "judge alone" row shows the agreement without that rule. Grades and ratings are
+always the judge's own.
 """
 
 import argparse
@@ -38,7 +43,7 @@ from typing import Any
 
 from hardened_llm_gateway.evals.dataset import EvalFileError, EvalItem, load
 from hardened_llm_gateway.evals.judge import PASS_RATING
-from hardened_llm_gateway.evals.run import default_files
+from hardened_llm_gateway.evals.run import CUT_OFF, default_files
 from hardened_llm_gateway.evals.stats import compare, mean_interval
 
 LABELS = Path("evals/calibration/labels.jsonl")
@@ -70,6 +75,7 @@ def judged_records(folder: Path) -> list[dict[str, Any]]:
             and record.get("split") == "dev"
             and record.get("passed") is not None
             and record.get("error") is None
+            and record.get("extracted") != CUT_OFF  # failed without a verdict to check
         ):
             records.append(
                 record
@@ -118,6 +124,7 @@ def to_label(record: dict[str, Any], item: EvalItem) -> dict[str, Any]:
         "question": "\n\n".join(m.content for m in item.messages if m.role == "user"),
         "reference": item.answer,
         "reply": record.get("reply", ""),
+        "cut_off": record.get("finish_reason") == "length",
         "judge": judge,
         "judge_model": record["judge_model"],
         "judge_prompt_version": record["judge_prompt_version"],
@@ -250,12 +257,26 @@ def _passes(task: str, verdict: str | float) -> bool:
     return int(verdict) >= PASS_RATING
 
 
+def _judge_passes(label: dict[str, Any]) -> bool:
+    """The pipeline's verdict: the judge's, except that a cut-off reply always fails."""
+    return _passes(label["task"], label["judge"]) and not label.get("cut_off", False)
+
+
+def _person_passes(label: dict[str, Any]) -> bool:
+    return _passes(label["task"], label["human"])
+
+
 def score(labels: Sequence[dict[str, Any]]) -> str:
     done = [x for x in labels if x["human"] not in (None, SKIPPED)]
     lines = [
         f"{len(done)} labelled items ({len(labels) - len(done)} unlabelled or skipped)",
         *_judges(done),
     ]
+    if cut := sum(bool(x.get("cut_off")) for x in done):
+        lines.append(
+            f"{cut} replies were cut off at the token limit: they fail whatever the judge "
+            "said, as in the runner"
+        )
     facts = [x for x in done if x["task"] == "facts"]
     chat = [x for x in done if x["task"] == "chat"]
     if facts:
@@ -278,13 +299,14 @@ def _judges(done: Sequence[dict[str, Any]]) -> list[str]:
 def _facts_report(facts: Sequence[dict[str, Any]]) -> list[str]:
     grades = [(x["judge"], x["human"]) for x in facts]
     exact = agreement([(a == b, True) for a, b in grades])
-    passing = agreement([(_passes("facts", a), _passes("facts", b)) for a, b in grades])
+    passing = agreement([(_judge_passes(x), _person_passes(x)) for x in facts])
     kappa = cohen_kappa(grades)
     assert exact is not None and passing is not None and kappa is not None
     lines = [
         f"  same grade:      {_agree(exact)}  Cohen's kappa {kappa:.2f}",
         f"  same pass/fail:  {_agree(passing)}",
-        *_per_verdict("facts", facts),
+        *_judge_alone(facts),
+        *_per_verdict(facts),
         "",
         "  judge (rows) by person (columns):",
     ]
@@ -299,11 +321,9 @@ def _facts_report(facts: Sequence[dict[str, Any]]) -> list[str]:
 def _chat_report(chat: Sequence[dict[str, Any]]) -> list[str]:
     judge = [float(x["judge"]) for x in chat]
     person = [float(x["human"]) for x in chat]
-    passing = agreement(
-        [(_passes("chat", a), _passes("chat", b)) for a, b in zip(judge, person, strict=True)]
-    )
+    passing = agreement([(_judge_passes(x), _person_passes(x)) for x in chat])
     assert passing is not None
-    lines = [f"  same pass/fail:  {_agree(passing)}", *_per_verdict("chat", chat)]
+    lines = [f"  same pass/fail:  {_agree(passing)}", *_judge_alone(chat), *_per_verdict(chat)]
     gap = statistics.fmean(abs(a - b) for a, b in zip(judge, person, strict=True))
     lines.append(f"  mean |judge - person| rating: {gap:.2f}")
     result = compare([p / 10 for p in person], [j / 10 for j in judge])
@@ -319,11 +339,20 @@ def _chat_report(chat: Sequence[dict[str, Any]]) -> list[str]:
     return lines
 
 
-def _per_verdict(task: str, items: Sequence[dict[str, Any]]) -> list[str]:
+def _judge_alone(items: Sequence[dict[str, Any]]) -> list[str]:
+    """Pass/fail agreement without the cut-off rule, when the rule changed anything."""
+    if not any(x.get("cut_off") for x in items):
+        return []
+    alone = agreement([(_passes(x["task"], x["judge"]), _person_passes(x)) for x in items])
+    assert alone is not None
+    return [f"  judge alone:     {_agree(alone)}  (without the cut-off rule)"]
+
+
+def _per_verdict(items: Sequence[dict[str, Any]]) -> list[str]:
     lines = []
     for says, word in ((True, "pass"), (False, "fail")):
-        group = [x for x in items if _passes(task, x["judge"]) == says]
-        result = agreement([(says, _passes(task, x["human"])) for x in group])
+        group = [x for x in items if _judge_passes(x) == says]
+        result = agreement([(says, _person_passes(x)) for x in group])
         if result is not None:
             lines.append(f"  judge says {word}: person agrees {_agree(result)}")
     return lines
@@ -333,8 +362,8 @@ def _model_report(done: Sequence[dict[str, Any]]) -> list[str]:
     lines = [f"  {'model':<30}{'items':>6}{'person':>8}{'judge':>8}{'diff':>8}"]
     for model in sorted({x["model"] for x in done}):
         group = [x for x in done if x["model"] == model]
-        person = statistics.fmean(_passes(x["task"], x["human"]) for x in group)
-        judge = statistics.fmean(_passes(x["task"], x["judge"]) for x in group)
+        person = statistics.fmean(_person_passes(x) for x in group)
+        judge = statistics.fmean(_judge_passes(x) for x in group)
         lines.append(
             f"  {model:<30}{len(group):>6}{person:>8.0%}{judge:>8.0%}{judge - person:>+8.0%}"
         )
