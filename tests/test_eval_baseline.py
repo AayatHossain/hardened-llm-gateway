@@ -164,7 +164,9 @@ def test_report(tmp_path: Path) -> None:
         report
     )
     assert "graded by groq/openai/gpt-oss-120b (prompt version 1)." in report
+    assert "[calibration/RESULTS.md](calibration/RESULTS.md)" in report
     assert "not comparable" not in report
+    assert "different token limits" not in report
 
     rows = [line for line in report.splitlines() if line.startswith("| ")]
     assert rows[0] == "| Model | Total | Maths | Chat |"
@@ -173,6 +175,14 @@ def test_report(tmp_path: Path) -> None:
     assert "| groq/a | $0.20 (2 replies unpriced) | 100 / 50 | 1.2 s | 3 | 1 | 1 |" in rows
     assert "| gemini/b | unknown | 100 / 50 | 1.2 s | 0 | 0 | 0 |" in rows
     assert "| groq/a | `ra` | 2026-11-20 | 0.0 | 4096 | `7e4df5d` |" in rows
+
+
+def test_report_warns_about_different_token_limits(tmp_path: Path) -> None:
+    capped = run_info("groq/a", options={"temperature": 0.0, "max_tokens": 1000})
+    runs = [
+        read_run(write_run(tmp_path, n, i)) for n, i in [("ra", capped), ("rb", run_info("b/b"))]
+    ]
+    assert "**The runs used different token limits (1000, 4096).**" in render(runs, EVAL_SET)
 
 
 def test_report_warns_about_different_judges(tmp_path: Path) -> None:
