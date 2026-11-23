@@ -19,6 +19,7 @@ from hardened_llm_gateway.evals.calibrate import (
     write_labels,
 )
 from hardened_llm_gateway.evals.dataset import EvalItem
+from hardened_llm_gateway.evals.run import CUT_OFF
 
 
 def eval_item(id: str, task: str, grader: str, split: str = "dev", **fields: Any) -> str:
@@ -79,6 +80,7 @@ def model_run(folder: Path, model: str) -> Path:
         result("m0", "maths", True, "4", grader="numeric"),  # not judged: left out
         result("f9", "facts", None, "", detail="judge failed"),  # ungraded: left out
         result("f8", "facts", False, "", error="HTTP 502"),  # model error: left out
+        result("c9", "chat", False, CUT_OFF, finish_reason="length"),  # no verdict: left out
     ]
     return write_run(folder, model, records)
 
@@ -133,6 +135,7 @@ def test_sample_command(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> N
     assert f0["reference"] == f"answer {number}"
     assert f0["reply"] == f"reply to {f0['id']}"
     assert f0["human"] is None
+    assert f0["cut_off"] is False
     chat = [r for r in rows if r["task"] == "chat"]
     assert chat and all(isinstance(r["judge"], int) for r in chat)
 
@@ -214,9 +217,11 @@ def test_cohen_kappa() -> None:
     assert cohen_kappa([("y", "y")] * 3) == 1.0  # 1 class only: no chance to disagree
 
 
-def labelled(task: str, model: str, judge: str | int, human: str | int | None) -> dict[str, Any]:
+def labelled(
+    task: str, model: str, judge: str | int, human: str | int | None, cut_off: bool = False
+) -> dict[str, Any]:
     return {"id": "x", "task": task, "model": model, "judge": judge, "human": human,
-            "judge_model": "groq/judge", "judge_prompt_version": 1}  # fmt: skip
+            "cut_off": cut_off, "judge_model": "groq/judge", "judge_prompt_version": 1}  # fmt: skip
 
 
 def test_score_report() -> None:
@@ -247,6 +252,26 @@ def test_score_report() -> None:
     # groq/a: person passes 2 of 4, judge 3 of 4; gemini/b: person 1 of 3, judge 0 of 3
     assert "groq/a                             4     50%     75%    +25%" in report
     assert "gemini/b                           3     33%      0%    -33%" in report
+    assert "cut off" not in report and "judge alone" not in report  # no cut-off replies
+
+
+def test_a_cut_off_reply_is_the_judges_fail() -> None:
+    labels = [
+        labelled("chat", "groq/a", 9, 5, cut_off=True),  # the judge rated it as if whole
+        labelled("chat", "groq/a", 8, 8, cut_off=True),  # the rule fails a reply the person passed
+        labelled("chat", "groq/a", 9, 9),
+        labelled("facts", "groq/a", "INCORRECT", "INCORRECT"),
+    ]
+    report = score(labels)
+    assert "2 replies were cut off at the token limit" in report
+    # with the rule: agree on the 1st and 3rd; without it: on the 2nd and 3rd
+    assert "same pass/fail:  2/3 = 67%" in report
+    assert "judge alone:     2/3 = 67% [21%, 94%]  (without the cut-off rule)" in report
+    assert "judge says pass: person agrees 1/1 = 100%" in report
+    assert "judge says fail: person agrees 1/2 = 50%" in report
+    assert "judge - person rating: +1.33" in report  # ratings stay the judge's own
+    assert "groq/a                             4     50%     25%    -25%" in report
+    assert report.count("judge alone") == 1  # only where the rule applies (not facts)
 
 
 def test_score_and_label_commands(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
