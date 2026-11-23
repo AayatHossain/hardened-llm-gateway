@@ -226,13 +226,13 @@
   },
   "simpleqa-1738": {
    "error": null,
-   "extracted": "NOT_ATTEMPTED",
+   "extracted": "CUT_OFF",
    "passed": false,
    "score": 0.0
   },
   "simpleqa-1787": {
    "error": null,
-   "extracted": "NOT_ATTEMPTED",
+   "extracted": "CUT_OFF",
    "passed": false,
    "score": 0.0
   },
