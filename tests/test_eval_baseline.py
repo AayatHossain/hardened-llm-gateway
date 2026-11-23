@@ -15,6 +15,7 @@ from hardened_llm_gateway.evals.baseline import (
     read_run,
     render,
 )
+from hardened_llm_gateway.evals.run import GRADING_VERSION
 
 FINGERPRINT = "047f881e4b3b"
 EVAL_SET = EvalSetInfo(FINGERPRINT, 10, {"maths": 6, "chat": 4})
@@ -52,6 +53,7 @@ def run_info(model: str, total: float = 0.7, **changes: Any) -> dict[str, Any]:
         "options": {"temperature": 0.0, "max_tokens": 4096},
         "judge": "groq/openai/gpt-oss-120b",
         "judge_prompt_version": 1,
+        "grading_version": GRADING_VERSION,
         "complete": True,
         "summary": {
             "maths": task(0.5, (0.19, 0.81), 6),
@@ -105,11 +107,26 @@ def test_a_full_test_split_run_counts(tmp_path: Path) -> None:
         ({"tasks": ["maths"]}, "only some tasks (maths)"),
         ({"limit": 20}, "a sample of 20 items"),
         ({"set_fingerprint": "old"}, f"eval set old, not today's {FINGERPRINT}"),
+        (
+            {"grading_version": 1},
+            f"graded by older rules (version 1, now {GRADING_VERSION}); "
+            "rerun it: replies and verdicts come from the cache",
+        ),
     ],
 )
 def test_other_runs_do_not(tmp_path: Path, changes: dict[str, Any], reason: str) -> None:
     run = read_run(write_run(tmp_path, "r", run_info("groq/a", **changes)))
     assert problems(run, EVAL_SET) == [reason]
+
+
+def test_a_run_from_before_grading_versions_is_version_1(tmp_path: Path) -> None:
+    info = run_info("groq/a")
+    del info["grading_version"]
+    run = read_run(write_run(tmp_path, "r", info))
+    assert problems(run, EVAL_SET) == [
+        f"graded by older rules (version 1, now {GRADING_VERSION}); "
+        "rerun it: replies and verdicts come from the cache"
+    ]
 
 
 def test_latest_runs_takes_each_models_newest_baseline_run(tmp_path: Path) -> None:

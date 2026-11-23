@@ -7,7 +7,9 @@
   So eval calls are retried, priced, logged and traced like any other traffic. The
   runner signs in as the client "eval-runner" with a one-off key.
 - **Grading.** Replies are graded by `graders`, and judge items by `judge`. The
-  judge's calls also go through the gateway.
+  judge's calls also go through the gateway. A judge item whose reply was cut off at
+  the token limit fails without asking the judge: calibration showed the judge rates
+  unfinished replies as if they were complete.
 - **Rate limits.** Calls to each provider are spaced to stay under its free-tier
   requests per minute (`PROVIDER_RPM`), shared by model and judge calls. Rate limits
   (429) and timeouts (503, 504) are retried, waiting up to 60 s.
@@ -66,6 +68,10 @@ from hardened_llm_gateway.report import percentile
 EVAL_CLIENT = "eval-runner"
 DATA = Path("evals/data")
 STOPPED_EXIT = 3  # the command's exit code when a quota stopped the run early
+# Bump when a grading rule changes, so runs graded by older rules are not compared
+# with new ones. 2: a judge item whose reply was cut off fails without a verdict.
+GRADING_VERSION = 2
+CUT_OFF = "CUT_OFF"  # `extracted` of a judge item failed for being cut off
 
 # Free-tier requests per minute, a little under the published limits.
 PROVIDER_RPM: dict[str, float] = {"groq": 25, "gemini": 8, "nvidia": 35, "openrouter": 15}
@@ -379,6 +385,14 @@ async def _run_one(
         cache.put(key, reply)
     record |= reply
 
+    if item.grader == "judge" and reply.get("finish_reason") == "length":
+        # The judge is not told a reply is unfinished and rates it as if it were whole.
+        return record | {
+            "passed": False,
+            "score": 0.0,
+            "extracted": CUT_OFF,
+            "detail": "cut off at the token limit: failed without asking the judge",
+        }
     try:
         if item.grader == "judge":
             if judge is None:
@@ -530,6 +544,7 @@ async def run_eval(
             "options": asdict(options),
             "judge": judge_target,
             "judge_prompt_version": PROMPT_VERSION,
+            "grading_version": GRADING_VERSION,
         }
         _write_json(folder / "run.json", meta)
         records, stop = await run_items(

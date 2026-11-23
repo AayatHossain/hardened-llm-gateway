@@ -12,6 +12,8 @@ from hardened_llm_gateway.config import Settings
 from hardened_llm_gateway.evals.cache import JsonlCache
 from hardened_llm_gateway.evals.dataset import EvalItem, EvalSet
 from hardened_llm_gateway.evals.run import (
+    CUT_OFF,
+    GRADING_VERSION,
     ModelCallError,
     PacedProvider,
     Pacer,
@@ -48,6 +50,7 @@ class Scripted:
         self._name = name
         self.answers = answers
         self.prompts: list[str] = []
+        self.cut_off: set[str] = set()  # needles whose replies stop at the token limit
 
     @property
     def name(self) -> str:
@@ -65,7 +68,7 @@ class Scripted:
                     provider=self._name,
                     model=request.model,
                     content=answer,
-                    finish_reason="stop",
+                    finish_reason="length" if needle in self.cut_off else "stop",
                     usage=Usage(prompt_tokens=100, completion_tokens=10, total_tokens=110),
                     latency_ms=12.0,
                 )
@@ -204,6 +207,22 @@ async def test_a_rerun_only_pays_for_what_is_new(tmp_path: Path) -> None:
     assert len(judge.prompts) == 2  # every verdict came from the cache
     assert {id for id, r in again.items() if not r["cached"]} == {"broken"}
     assert again["pens"]["cost_usd"] > 0  # the original cost is kept
+
+
+async def test_a_cut_off_judge_item_fails_without_asking_the_judge(tmp_path: Path) -> None:
+    model, judge = providers()
+    model.cut_off = {"haiku", "pens"}
+    folder = await run(tmp_path, model, judge)
+    records = results(folder)
+
+    haiku = records["haiku"]
+    assert (haiku["passed"], haiku["score"], haiku["extracted"]) == (False, 0.0, CUT_OFF)
+    assert haiku["finish_reason"] == "length"
+    assert all("Soft rain" not in p for p in judge.prompts)  # the judge never saw it
+    assert records["hamlet"]["passed"] is True  # a whole reply is judged as before
+    assert records["pens"]["passed"] is True  # rule graders read a cut-off reply as before
+    run_info = json.loads((folder / "run.json").read_text(encoding="utf-8"))
+    assert run_info["grading_version"] == GRADING_VERSION
 
 
 async def test_without_a_judge_judge_items_stay_ungraded(tmp_path: Path) -> None:
