@@ -155,12 +155,21 @@ def render(runs: Sequence[BaselineRun], eval_set: EvalSetInfo) -> str:
         "`evals.stats` for that.",
         "",
         f"Judged items (facts without a numeric answer, and chat) were graded by "
-        f"{' and '.join(judges)}.",
+        f"{' and '.join(judges)}. How often the judge agrees with a person is measured in "
+        "[calibration/RESULTS.md](calibration/RESULTS.md).",
     ]
     if len(judges) > 1:
         lines.append(
             "**These runs used different judges, so their judged scores are not comparable.**"
         )
+    limits = sorted({str(r.info.get("options", {}).get("max_tokens", "?")) for r in ranked})
+    if len(limits) > 1:
+        lines += [
+            "",
+            f"**The runs used different token limits ({', '.join(limits)}).** A lower limit "
+            "cuts off more replies, so those models' scores may be lower than they would be "
+            "with a higher one.",
+        ]
 
     lines += ["", "## Scores", ""]
     lines += _table(
@@ -189,7 +198,8 @@ def render(runs: Sequence[BaselineRun], eval_set: EvalSetInfo) -> str:
         "- **List price:** what the replies would cost at the provider's paid prices "
         "(`prices.toml`); the runs themselves used free tiers. It leaves out the judge.",
         "- **Cut off:** replies that hit the token limit, often a reasoning model that "
-        "never got to answer. They are graded as they are.",
+        "never got to answer. Judged items cut off fail without a verdict, since the judge "
+        "rates unfinished replies as if they were whole; other tasks grade them as they are.",
         "- **Errors:** items the model or provider failed to answer; they score 0.",
         "- **Ungraded:** items the judge could not grade; they are left out of the score.",
     ]
