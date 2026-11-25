@@ -16,6 +16,13 @@
 # - groq:   the "pricing" field of GET https://api.groq.com/openai/v1/models
 #           (allam-2-7b has no price there, so it is left out)
 # - gemini: https://aistudio.google.com/docs/pricing (Standard paid tier)
+#
+# Checked 2026-11-26:
+# - cohere: https://cohere.com/pricing lists no per-token price for the Command A
+#           models, so these are Cohere's prices as listed by OpenRouter
+#           (GET https://openrouter.ai/api/v1/models, provider Cohere)
+# - zai:    https://docs.z.ai/guides/overview/pricing (the -flash models are free
+#           on every tier, so they cost 0)
 
 # --- Groq --------------------------------------------------------------------
 
@@ -95,4 +102,32 @@ output = 2.50
 
 [models."gemini/gemini-2.5-flash-lite"]
 input = 0.10
+output = 0.40
+
+# --- Cohere ------------------------------------------------------------------
+
+[models."cohere/command-a-plus-05-2026"]
+input = 0.30
+output = 1.50
+
+[models."cohere/command-a-03-2025"]
+input = 2.50
+output = 10.00
+
+[models."cohere/command-r7b-12-2024"]
+input = 0.0375
+output = 0.15
+
+# --- Z.ai --------------------------------------------------------------------
+
+[models."zai/glm-4.7-flash"]
+input = 0.00
+output = 0.00
+
+[models."zai/glm-4.5-flash"]
+input = 0.00
+output = 0.00
+
+[models."zai/glm-4.7-flashx"]
+input = 0.07
 output = 0.40
