@@ -88,6 +88,19 @@ def _chat_model_ids(models: _ModelList) -> list[str]:
     return sorted(ids)
 
 
+def _billed(usage: Usage) -> Usage:
+    """Usage with hidden reasoning tokens counted as output, as they are billed.
+
+    Gemini leaves its thinking tokens out of completion_tokens but keeps them in
+    total_tokens, so a reply looks several times cheaper than it is. Providers that
+    already count reasoning as output (Groq) have nothing left over and are unchanged.
+    """
+    hidden = usage.total_tokens - usage.prompt_tokens - usage.completion_tokens
+    if hidden <= 0:
+        return usage
+    return usage.model_copy(update={"completion_tokens": usage.completion_tokens + hidden})
+
+
 def _error_reason(response: httpx.Response) -> str | None:
     """The provider's error message, from {"error": {"message": ...}}.
 
@@ -187,7 +200,7 @@ class OpenAICompatibleProvider:
             model=completion.model,
             content=choice.message.content or "",
             finish_reason=choice.finish_reason,
-            usage=completion.usage,
+            usage=_billed(completion.usage),
             latency_ms=latency_ms,
         )
 
@@ -245,5 +258,5 @@ class OpenAICompatibleProvider:
             model=event.model,
             delta=choice.delta.content or "",
             finish_reason=choice.finish_reason,
-            usage=usage,
+            usage=_billed(usage) if usage else None,
         )
