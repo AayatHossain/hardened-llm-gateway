@@ -27,6 +27,8 @@ PROVIDER_SPECS: tuple[ProviderSpec, ...] = (
     ),
     ProviderSpec("nvidia", "https://integrate.api.nvidia.com/v1", "nvidia_api_key"),
     ProviderSpec("openrouter", "https://openrouter.ai/api/v1", "openrouter_api_key"),
+    ProviderSpec("cohere", "https://api.cohere.ai/compatibility/v1", "cohere_api_key"),
+    ProviderSpec("zai", "https://api.z.ai/api/paas/v4", "zai_api_key"),
 )
 
 
