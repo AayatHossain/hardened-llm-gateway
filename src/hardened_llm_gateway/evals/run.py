@@ -73,8 +73,15 @@ STOPPED_EXIT = 3  # the command's exit code when a quota stopped the run early
 GRADING_VERSION = 2
 CUT_OFF = "CUT_OFF"  # `extracted` of a judge item failed for being cut off
 
-# Free-tier requests per minute, a little under the published limits.
-PROVIDER_RPM: dict[str, float] = {"groq": 25, "gemini": 8, "nvidia": 35, "openrouter": 15}
+# Free-tier requests per minute, a little under the published limits. Z.ai publishes
+# none for its free models, so it gets the default.
+PROVIDER_RPM: dict[str, float] = {
+    "groq": 25,
+    "gemini": 8,
+    "nvidia": 35,
+    "openrouter": 15,
+    "cohere": 15,  # trial key: 20 a minute, 1,000 a month
+}
 DEFAULT_RPM = 10.0
 
 RUN_RETRY = RetryPolicy(max_retries=5, backoff_seconds=2.0, max_wait_seconds=60.0)
