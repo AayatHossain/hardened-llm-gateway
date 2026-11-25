@@ -251,6 +251,33 @@ async def test_stream_reads_groq_usage() -> None:
     assert pieces[0].usage.total_tokens == 2
 
 
+async def test_hidden_reasoning_tokens_count_as_output() -> None:
+    """Gemini keeps thinking tokens out of completion_tokens but in total_tokens."""
+    body = completion_body()
+    body["usage"] = {"prompt_tokens": 12, "completion_tokens": 60, "total_tokens": 226}
+    reply = await make_provider(lambda _: httpx.Response(200, json=body)).chat(make_request())
+    assert reply.usage.prompt_tokens == 12
+    assert reply.usage.completion_tokens == 214  # 60 visible + 154 thinking
+    assert reply.usage.total_tokens == 226
+
+    usage = {"prompt_tokens": 12, "completion_tokens": 60, "total_tokens": 226}
+    stream = sse(chunk("hi", finish="stop"), {"choices": [], "usage": usage}, "[DONE]")
+    pieces = await collect(make_provider(lambda _: httpx.Response(200, content=stream)))
+    assert pieces[-1].usage is not None
+    assert pieces[-1].usage.completion_tokens == 214
+
+
+async def test_usage_that_already_adds_up_is_unchanged() -> None:
+    body = completion_body()
+    body["usage"] = {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}
+    reply = await make_provider(lambda _: httpx.Response(200, json=body)).chat(make_request())
+    assert reply.usage.completion_tokens == 2
+
+    body["usage"] = {"prompt_tokens": 5, "completion_tokens": 2}  # no total given
+    reply = await make_provider(lambda _: httpx.Response(200, json=body)).chat(make_request())
+    assert reply.usage.completion_tokens == 2
+
+
 async def test_stream_http_error_is_raised_before_any_piece() -> None:
     provider = make_provider(
         lambda _: httpx.Response(429, headers={"retry-after": "3"}, json={"error": "slow down"})
