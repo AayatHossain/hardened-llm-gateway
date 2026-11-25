@@ -39,10 +39,12 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+    cohere_api_key: SecretStr | None = None
     gemini_api_key: SecretStr | None = None
     groq_api_key: SecretStr | None = None
     nvidia_api_key: SecretStr | None = None
     openrouter_api_key: SecretStr | None = None
+    zai_api_key: SecretStr | None = None
 
     request_timeout_seconds: float = Field(default=30.0, gt=0)
     log_level: str = "INFO"

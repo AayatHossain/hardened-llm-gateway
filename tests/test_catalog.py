@@ -16,6 +16,15 @@ async def test_only_providers_with_keys_are_built() -> None:
     assert providers["groq"].name == "groq"
 
 
+async def test_cohere_and_zai_are_built_from_their_keys() -> None:
+    settings = Settings(cohere_api_key=SecretStr("c-key"), zai_api_key=SecretStr("z-key"))
+    async with httpx.AsyncClient() as client:
+        providers = build_providers(settings, client)
+    assert sorted(providers) == ["cohere", "zai"]
+    assert "api.cohere.ai/compatibility/v1/chat/completions" in repr(providers["cohere"])
+    assert "api.z.ai/api/paas/v4/chat/completions" in repr(providers["zai"])
+
+
 async def test_empty_key_counts_as_missing() -> None:
     settings = Settings(groq_api_key=SecretStr(""))
     async with httpx.AsyncClient() as client:

@@ -1,8 +1,8 @@
 """One adapter for every provider that speaks the OpenAI chat format.
 
-Groq, Gemini (OpenAI-compatible endpoint), NVIDIA NIM and OpenRouter all accept
-POST {base_url}/chat/completions and GET {base_url}/models with a Bearer key, so they
-share this code and differ only in base URL and key.
+Groq, Gemini and Cohere (their OpenAI-compatible endpoints), NVIDIA NIM, OpenRouter
+and Z.ai all accept POST {base_url}/chat/completions and GET {base_url}/models with a
+Bearer key, so they share this code and differ only in base URL and key.
 """
 
 import time
